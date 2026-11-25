@@ -1,0 +1,9 @@
+.venv/
+data/
+models/
+embeddings/
+indexes/
+.cache/
+.env
+__pycache__/
+*.log
