@@ -7,3 +7,4 @@ indexes/
 .env
 __pycache__/
 *.log
+.venv-uv/
