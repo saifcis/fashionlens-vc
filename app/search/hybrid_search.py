@@ -10,18 +10,20 @@ class HybridSearch:
         self.keyword_search = keyword_search
         self.vector_search = vector_search
 
-    def search(self, query, limit=10):
+    def search(self, query, limit=10, *, eligible_ids=None):
 
         candidate_limit = max(limit * 5, 20)
 
         keyword_results = self.keyword_search.search(
             query,
-            limit=candidate_limit
+            limit=candidate_limit,
+            eligible_ids=eligible_ids,
         )
 
         semantic_results = self.vector_search.search_text(
             query,
-            limit=candidate_limit
+            limit=candidate_limit,
+            eligible_ids=eligible_ids,
         )
 
         return self.fuse(

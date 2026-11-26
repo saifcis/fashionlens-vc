@@ -35,11 +35,18 @@ class FuzzySearch:
             for index, product in enumerate(self.products)
         }
 
-    def search(self, query, limit=10):
+    def search(self, query, limit=10, *, eligible_ids=None):
+
+        choices = self.choices
+        if eligible_ids is not None:
+            choices = {
+                index: value for index, value in choices.items()
+                if self.products[index]["id"] in eligible_ids
+            }
 
         matches = process.extract(
             query.lower(),
-            self.choices,
+            choices,
             scorer=fuzz.WRatio,
             limit=limit,
             score_cutoff=40

@@ -26,16 +26,24 @@
     border-bottom: 1px solid var(--fl-border);
 }
 
-.fl-wordmark {
+.st-key-site_header a {
+    padding: 0;
+    min-height: 0;
+    width: fit-content;
+    color: var(--fl-ink);
+    text-decoration: none;
+}
+
+.st-key-site_header a p {
     font-size: clamp(1.45rem, 3vw, 2rem);
     line-height: 1.15;
-    font-weight: 800;
+    font-weight: 400;
     letter-spacing: -.055em;
     white-space: nowrap;
 }
 
-.fl-wordmark span {
-    font-weight: 400;
+.st-key-site_header a strong {
+    font-weight: 800;
 }
 
 .st-key-collection_nav [data-testid="stButtonGroup"] button {

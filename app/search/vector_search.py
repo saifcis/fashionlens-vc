@@ -30,11 +30,14 @@ class VectorSearch:
         ):
             raise ValueError("Invalid embedding shape")
 
-    def search_vector(self, query_embedding, limit=10):
+    def search_vector(self, query_embedding, limit=10, *, eligible_ids=None):
 
         scores = self.embeddings @ query_embedding
 
-        indices = np.argsort(-scores)[:limit]
+        indices = np.argsort(-scores)
+        if eligible_ids is not None:
+            indices = indices[np.isin(self.product_ids[indices], list(eligible_ids))]
+        indices = indices[:limit]
 
         results = []
 
@@ -62,24 +65,26 @@ class VectorSearch:
 
         return results
 
-    def search_text(self, text, limit=10):
+    def search_text(self, text, limit=10, *, eligible_ids=None):
 
         embedding = self.provider.encode_text(text)
 
-        return self.search_vector(embedding, limit)
+        return self.search_vector(embedding, limit, eligible_ids=eligible_ids)
 
-    def search_image(self, image_path, limit=10):
+    def search_image(self, image_path, limit=10, *, eligible_ids=None):
 
         embedding = self.provider.encode_image(image_path)
 
-        return self.search_vector(embedding, limit)
+        return self.search_vector(embedding, limit, eligible_ids=eligible_ids)
 
     def search_multimodal(
         self,
         text,
         image_path,
         image_weight=0.5,
-        limit=10
+        limit=10,
+        *,
+        eligible_ids=None,
     ):
 
         if not 0 <= image_weight <= 1:
@@ -103,5 +108,5 @@ class VectorSearch:
 
         combined = combined / norm
 
-        return self.search_vector(combined, limit)
+        return self.search_vector(combined, limit, eligible_ids=eligible_ids)
 

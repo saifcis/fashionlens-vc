@@ -1,4 +1,5 @@
 
+import json
 import re
 import sqlite3
 
@@ -8,7 +9,7 @@ class KeywordSearch:
     def __init__(self, database="data/catalog.db"):
         self.database = database
 
-    def search(self, query, limit=10):
+    def search(self, query, limit=10, *, eligible_ids=None):
 
         tokens = re.findall(r"\w+", query.lower())
 
@@ -20,11 +21,20 @@ class KeywordSearch:
             f'"{token}"' for token in tokens
         )
 
+        if eligible_ids is not None and not eligible_ids:
+            return []
+
+        constraint = ""
+        parameters = [expression]
+        if eligible_ids is not None:
+            constraint = "AND p.id IN (SELECT value FROM json_each(?))"
+            parameters.append(json.dumps(sorted(eligible_ids)))
+
         with sqlite3.connect(self.database) as connection:
 
             connection.row_factory = sqlite3.Row
 
-            results = connection.execute("""
+            results = connection.execute(f"""
                 SELECT
                     p.id,
                     p.name,
@@ -36,9 +46,10 @@ class KeywordSearch:
                 JOIN products p
                     ON p.id = products_fts.product_id
                 WHERE products_fts MATCH ?
+                {constraint}
                 ORDER BY score DESC
                 LIMIT ?
-            """, (expression, limit)).fetchall()
+            """, (*parameters, limit)).fetchall()
 
         return [dict(row) for row in results]
 
