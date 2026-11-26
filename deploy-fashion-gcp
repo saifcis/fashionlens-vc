@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export TZ=UTC
+
+PROJECT=${FASHION_GCP_PROJECT:-fashion-lens-poc}
+REGION=${FASHION_GCP_REGION:-europe-west3}
+REPOSITORY=${FASHION_GCP_REPOSITORY:-fashionlens}
+IMAGE_NAME=${FASHION_GCP_IMAGE:-fashionlens}
+SERVICE=${FASHION_GCP_SERVICE:-fashionlens}
+BRANCH=${FASHION_GIT_BRANCH:-main}
+PUBLIC_APP_URL=${PUBLIC_APP_URL:-https://fashionlens.cloud.run}
+PUBLIC_APP_URL=${PUBLIC_APP_URL%/}
+PORT=${FASHION_CONTAINER_PORT:-8080}
+MIN_DISK_KIB=${FASHION_MIN_DISK_KIB:-10485760}
+PROBE_ATTEMPTS=${FASHION_PROBE_ATTEMPTS:-24}
+PROBE_INTERVAL=${FASHION_PROBE_INTERVAL:-5}
+REGISTRY="$REGION-docker.pkg.dev"
+IMAGE="$REGISTRY/$PROJECT/$REPOSITORY/$IMAGE_NAME"
+TOTAL=10
+DESCRIPTIONS=(
+    'Check local tools, artifacts, authentication and existing infrastructure'
+    'Fetch origin and select committed source'
+    'Inspect the serving release and select a version'
+    'Stage source and validate dependencies, catalog and all six search modes'
+    'Build or recover the linux/amd64 image'
+    'Verify local Streamlit HTTP and run the smoke test without networking'
+    'Publish or verify Artifact Registry tags and immutable digest'
+    'Create and verify a Cloud Run revision without production traffic'
+    'Switch production traffic and verify the running release'
+    'Publish the annotated Git tag and record the outcome'
+)
+
+usage() {
+    cat <<'EOF'
+Usage: ./deploy-fashion-gcp [--dry-run] [--force] [--no-color] [--help]
+
+Deploy the latest committed origin/main revision to the existing Cloud Run service.
+  --dry-run   Print the plan without contacting Git, Docker or GCP.
+  --force     Create a new Cloud Run revision for an already deployed commit,
+              reusing its immutable image and release version.
+  --no-color  Disable terminal colours.
+  --help      Show this help.
+
+Overrides: FASHION_GCP_PROJECT, FASHION_GCP_REGION, FASHION_GCP_REPOSITORY,
+FASHION_GCP_IMAGE, FASHION_GCP_SERVICE, FASHION_GIT_BRANCH, FASHION_CONTAINER_PORT,
+FASHION_MIN_DISK_KIB, FASHION_PROBE_ATTEMPTS, FASHION_PROBE_INTERVAL.
+Set PUBLIC_APP_URL to override the public HTTPS origin checked after rollout and rollback.
+EOF
+}
+
+dry_run=0 force=0 color=0
+if [[ -t 1 && ${TERM:-dumb} != dumb && ! -v NO_COLOR ]]; then color=1; fi
+for option in "$@"; do
+    case "$option" in
+        --help) usage; exit 0 ;;
+        --dry-run) dry_run=1 ;;
+        --force) force=1 ;;
+        --no-color) color=0 ;;
+        *) printf 'Unknown argument: %s\n' "$option" >&2; exit 2 ;;
+    esac
+done
+
+step=0 step_start=0 started=$SECONDS log_file='' logged=0
+outcome=FAILED reason='' rollback_status='Not needed' tag_status='Pending'
+sha='' message='' previous_version='' version='' previous_revision='' revision=''
+digest='' cloud_run_url='' traffic='Unverified' health='Unverified' functional='Pending'
+tag='' old_traffic='' old_service_uid='' old_generation='' old_digest=''
+tmp='' web_container='' smoke_container='' preview_tag=''
+preview_requested=0 traffic_requested=0 deployed=0 duplicate=0 nonce=''
+history_written=0 last_command=''
+oci=org.opencontainers.image
+semver='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+digest_pattern='^sha256:[0-9a-f]{64}$'
+
+log() {
+    local shade=$1 label=$2
+    shift 2
+    local prefix='' suffix=''
+    if (( color )); then prefix=$'\033['"$shade"m; suffix=$'\033[0m'; fi
+    printf '%s[%(%FT%T%z)T] [%02d/%02d] %-7s %s%s\n' \
+        "$prefix" -1 "$step" "$TOTAL" "$label" "$*" "$suffix" >&2
+}
+info() { log 36 INFO "$@"; }
+success() { log 32 SUCCESS "$@"; }
+warn() { log 33 WARNING "$@"; }
+error() { log 31 ERROR "$@"; }
+duration() { printf '%dm %02ds' "$(($1 / 60))" "$(($1 % 60))"; }
+begin() {
+    step=$1
+    step_start=$SECONDS
+    info "${DESCRIPTIONS[step-1]}"
+}
+done_step() {
+    success "${DESCRIPTIONS[step-1]} completed ($(duration "$((SECONDS-step_start))"))."
+}
+fail() {
+    reason=$*
+    return 1
+}
+run() {
+    printf -v last_command '%q ' "$@"
+    info "$ $last_command"
+    "$@"
+}
+# Never print full service/configuration JSON or arbitrary Cloud application logs.
+capture() {
+    local destination=$1
+    shift
+    printf -v last_command '%q ' "$@"
+    info "$ $last_command (structured output captured)"
+    "$@" > "$destination"
+}
+cloud() {
+    timeout 90 gcloud "$@" --project="$PROJECT" --quiet
+}
+cloud_run() { cloud run "$@" --region="$REGION"; }
+service_snapshot() {
+    capture "$1" cloud_run services describe "$SERVICE" --format=json
+}
+revision_snapshot() {
+    capture "$2" cloud_run revisions describe "$1" --format=json
+}
+# Extract only the fields used by the release. Status traffic can include
+# multiple entries for one revision (for example when a traffic tag exists).
+read_cloud() {
+    python3 - "$@" <<'PY'
+import collections
+import json
+import sys
+
+field, path, *args = sys.argv[1:]
+with open(path) as stream:
+    data = json.load(stream)
+status = data.get("status", {})
+metadata = data.get("metadata", {})
+if field == "traffic":
+    shares = collections.Counter()
+    for item in status.get("traffic", []):
+        if item.get("percent", 0) > 0:
+            shares[item["revisionName"]] += item["percent"]
+    if sum(shares.values()) != 100:
+        sys.exit("Cloud Run does not report a complete 100% traffic allocation")
+    print(",".join(f"{name}={share}" for name, share in sorted(shares.items())))
+elif field == "ready":
+    print(next((c["status"] for c in status.get("conditions", []) if c["type"] == "Ready"), "Unknown"))
+elif field == "digest":
+    image = status.get("imageDigest", "")
+    if not image:
+        containers = status.get("containerStatuses", [])
+        if len(containers) == 1:
+            image = containers[0].get("imageDigest", "")
+    print(image.rsplit("@", 1)[-1])
+elif field == "tag-url":
+    print(next((i.get("url", "") for i in status.get("traffic", [])
+                if i.get("tag") == args[0] and i.get("revisionName") == args[1]), ""))
+elif field == "has-tag":
+    print(any(i.get("tag") == args[0]
+              for source in (status, data.get("spec", {}))
+              for i in source.get("traffic", [])))
+elif field == "summary":
+    for condition in status.get("conditions", []):
+        print(f"{condition['type']}={condition.get('status')} reason={condition.get('reason', '')}")
+elif field in {"uid", "generation"}:
+    print(metadata.get(field, ""))
+elif field == "url":
+    print(status.get("url", ""))
+elif field == "port":
+    containers = data["spec"]["template"]["spec"]["containers"]
+    if len(containers) != 1:
+        sys.exit("Only existing single-container services are supported")
+    print((containers[0].get("ports") or [{}])[0].get("containerPort", 8080))
+elif field == "image":
+    print(data["spec"]["containers"][0]["image"])
+else:
+    sys.exit(f"Unknown Cloud Run field: {field}")
+PY
+}
+
+probe_once() {
+    local url=$1 expected=${2:-} code
+    local -a curl_opts=(--silent --show-error --connect-timeout 5 --max-time 12
+        --header 'Cache-Control: no-cache' --output "$tmp/http" --write-out '%{http_code}')
+    code=$(curl "${curl_opts[@]}" "$url/") || return
+    info "$url/ returned HTTP $code"
+    [[ $code == 200 ]] || return 1
+    code=$(curl "${curl_opts[@]}" "$url/_stcore/health") || return
+    info "$url/_stcore/health returned HTTP $code"
+    [[ $code == 200 && $(<"$tmp/http") == ok ]] || return 1
+    if [[ -n $expected ]]; then
+        code=$(curl "${curl_opts[@]}" "$url/app/static/fashionlens-release.txt") || return
+        info "$url/app/static/fashionlens-release.txt returned HTTP $code"
+        [[ $code == 200 && $(<"$tmp/http") == "$expected" ]] || return 1
+    fi
+}
+probe() {
+    local attempt url=$1 expected=${2:-}
+    last_command="curl HTTP, Streamlit health and release marker at $url"
+    for ((attempt=1; attempt<=PROBE_ATTEMPTS; attempt++)); do
+        if probe_once "$url" "$expected"; then return 0; fi
+        warn "HTTP/health/release check failed ($attempt/$PROBE_ATTEMPTS) at $url"
+        if (( attempt < PROBE_ATTEMPTS )); then sleep "$PROBE_INTERVAL" || return; fi
+    done
+    fail "HTTP, Streamlit health or release identity verification failed at $url"
+}
+ready_revision() {
+    local name=$1 expected_digest=$2 attempt actual ready
+    for ((attempt=1; attempt<=PROBE_ATTEMPTS; attempt++)); do
+        revision_snapshot "$name" "$tmp/revision.json" || return
+        ready=$(read_cloud ready "$tmp/revision.json") || return
+        actual=$(read_cloud digest "$tmp/revision.json") || return
+        if [[ $ready == True && $actual == "$expected_digest" ]]; then return 0; fi
+        if [[ $ready == False || ( -n $actual && $actual != "$expected_digest" ) ]]; then break; fi
+        if (( attempt < PROBE_ATTEMPTS )); then sleep "$PROBE_INTERVAL" || return; fi
+    done
+    fail "Revision $name readiness=$ready, digest=$actual, expected digest=$expected_digest"
+}
+verify_traffic() {
+    local expected=$1 require_ready=${2:-1} attempt current ready url uid
+    for ((attempt=1; attempt<=PROBE_ATTEMPTS; attempt++)); do
+        service_snapshot "$tmp/service.json" || return
+        current=$(read_cloud traffic "$tmp/service.json") || return
+        ready=$(read_cloud ready "$tmp/service.json") || return
+        url=$(read_cloud url "$tmp/service.json") || return
+        uid=$(read_cloud uid "$tmp/service.json") || return
+        if [[ $current == "$expected" && $url == "$cloud_run_url" && $uid == "$old_service_uid" ]] &&
+            [[ $require_ready == 0 || $ready == True ]]; then
+            return 0
+        fi
+        if (( attempt < PROBE_ATTEMPTS )); then sleep "$PROBE_INTERVAL" || return; fi
+    done
+    fail "Expected ready service traffic $expected at $cloud_run_url; found $current (ready=$ready, URL=$url)"
+}
+
+startup_logs() {
+    local filter fatal matches attempt
+    filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND resource.labels.location=\"$REGION\" AND resource.labels.revision_name=\"$revision\""
+    # Messages can contain secrets. Show only timestamp, severity, and log type.
+    for ((attempt=1; attempt<=PROBE_ATTEMPTS; attempt++)); do
+        capture "$tmp/startup.log" cloud logging read "$filter" --freshness=1h --limit=15 \
+            '--format=value(timestamp,severity,logName.basename())' || return
+        if [[ -s $tmp/startup.log ]]; then break; fi
+        if (( attempt < PROBE_ATTEMPTS )); then sleep "$PROBE_INTERVAL" || return; fi
+    done
+    [[ -s $tmp/startup.log ]] ||
+        { fail 'No Cloud Run logs returned for this revision. Check log ingestion and exclusions.'; return; }
+    while IFS= read -r line; do info "Cloud Run log: $line"; done < "$tmp/startup.log"
+    fatal="$filter AND (severity>=ERROR OR textPayload=~\"(?i)(traceback|fatal|uncaught exception|failed to start)\")"
+    capture "$tmp/fatal.log" cloud logging read "$fatal" --freshness=1h --limit=1 \
+        '--format=value(timestamp,severity,logName.basename())' || return
+    if [[ -s $tmp/fatal.log ]]; then
+        matches=$(<"$tmp/fatal.log")
+        error "Cloud Run error log metadata: $matches"
+        fail "Cloud Run logged an error for $revision; inspect that revision in Cloud Logging"
+    fi
+}
+
+remove_preview() {
+    local found uid
+    service_snapshot "$tmp/remove-preview.json" || return
+    uid=$(read_cloud uid "$tmp/remove-preview.json") || return
+    [[ $uid == "$old_service_uid" ]] || return 1
+    found=$(read_cloud has-tag "$tmp/remove-preview.json" "$preview_tag") || return
+    if [[ $found == True ]]; then
+        run cloud_run services update-traffic "$SERVICE" --remove-tags="$preview_tag" || return
+    fi
+    preview_requested=0
+}
+rollback() {
+    local current target item name snapshot_digest
+    warn "Release failed: $reason"
+    if service_snapshot "$tmp/failure-service.json"; then
+        read_cloud summary "$tmp/failure-service.json" || warn 'Could not summarize service conditions.'
+    else
+        warn 'Could not collect service details.'
+    fi
+    if revision_snapshot "$revision" "$tmp/failure-revision.json"; then
+        read_cloud summary "$tmp/failure-revision.json" || warn 'Could not summarize revision conditions.'
+        PROBE_ATTEMPTS=1 startup_logs || warn 'Cloud logs contained errors or could not be retrieved.'
+    else
+        warn "Could not collect details for revision $revision."
+    fi
+    service_snapshot "$tmp/rollback.json" || return
+    current=$(read_cloud traffic "$tmp/rollback.json") || return
+    if [[ $(read_cloud uid "$tmp/rollback.json") != "$old_service_uid" ]]; then
+        error "The Cloud Run service identity changed."
+        return 1
+    fi
+    target="$revision=100"
+    if (( traffic_requested )) && [[ $current == "$target" ]]; then
+        run cloud_run services update-traffic "$SERVICE" --to-revisions="$old_traffic" || return
+    elif [[ $current != "$old_traffic" ]]; then
+        error "Production traffic changed concurrently ($current)."
+        return 1
+    elif (( traffic_requested )); then
+        # Reassert the previous allocation if the cutover timed out while pending.
+        run cloud_run services update-traffic "$SERVICE" --to-revisions="$old_traffic" || return
+    fi
+    remove_preview || return
+    verify_traffic "$old_traffic" 0 || return
+    if [[ $(read_cloud ready "$tmp/service.json") != True ]]; then
+        warn 'Cloud Run reports a degraded service condition. Checking the restored revisions and production HTTP.'
+    fi
+    local -a targets
+    IFS=, read -r -a targets <<< "$old_traffic"
+    for item in "${targets[@]}"; do
+        name=${item%=*}
+        revision_snapshot "$name" "$tmp/restored.json" || return
+        [[ $(read_cloud ready "$tmp/restored.json") == True ]] || return 1
+        if [[ $name == "$previous_revision" ]]; then
+            snapshot_digest=$(read_cloud digest "$tmp/restored.json") || return
+            [[ $snapshot_digest == "$old_digest" ]] || return 1
+        fi
+    done
+    probe "$PUBLIC_APP_URL" || return
+    traffic="Restored ($old_traffic)"
+    health='Previous deployment healthy'
+}
+record_history() {
+    printf '%(%FT%TZ)T\t%s\t%s\t%s\t%s\t%s\n' -1 \
+        "${version:--}" "${sha:--}" "${digest:--}" "${revision:--}" "$outcome" >> "$root/deployment/history.tsv"
+}
+cleanup() {
+    local name owner
+    for name in "$web_container" "$smoke_container"; do
+        [[ -n $name ]] || continue
+        if owner=$(docker container inspect --format '{{index .Config.Labels "com.fashionlens.deployment"}}' "$name" 2>/dev/null); then
+            if [[ $owner == "$nonce" ]]; then
+                run docker rm -f "$name" || warn "Remove temporary container $name manually."
+            fi
+        elif ! docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; then
+            warn "Docker is unavailable; check whether temporary container $name needs removal."
+        fi
+    done
+    if [[ -n $tmp ]]; then rm -rf -- "$tmp" || warn "Remove staging directory $tmp manually."; fi
+}
+summary() {
+    local report=success
+    case "$outcome" in
+        FAILED|ROLLED\ BACK) report=error ;;
+        PARTIAL\ SUCCESS) report=warn ;;
+    esac
+    "$report" "================ $outcome ================"
+    info "Versions: ${previous_version:--} → ${version:--}"
+    info "Commit: ${sha:--} ${message:-}"
+    info "Image tag: ${version:+$IMAGE:$version} | Digest: ${digest:--}"
+    info "Cloud Run revision: ${previous_revision:--} → ${revision:--} | Production traffic: $traffic"
+    info "Application health: $health | Functional validation: $functional"
+    info "Public application URL: $PUBLIC_APP_URL"
+    info "Git release tag: ${tag:--} | Push: $tag_status"
+    info "Duration: $(duration "$((SECONDS-started))") | Log: ${log_file:--}"
+}
+shutdown() {
+    local code=$?
+    trap - EXIT ERR INT TERM
+    set +e
+    if (( code != 0 )); then
+        if (( deployed )); then
+            outcome='PARTIAL SUCCESS'
+            error "The release is serving and was verified. Git or local finalization failed."
+            warn "Rerun ./deploy-fashion-gcp while origin/$BRANCH still points at $sha to retry finalization."
+            warn "If the branch has advanced, inspect v$version, verify it targets $sha, and finish publishing that annotated tag."
+        elif (( preview_requested )); then
+            if rollback; then
+                rollback_status='Previous traffic verified'
+                outcome='ROLLED BACK'
+            else
+                rollback_status='FAILED — manual intervention required'
+                error "Inspect Cloud Run service $SERVICE in $PROJECT/$REGION. Previous allocation: $old_traffic"
+            fi
+        fi
+        info "Rollback: $rollback_status"
+    fi
+    cleanup
+    if (( logged && ! history_written )) && [[ -n $sha && $duplicate == 0 ]]; then
+        record_history || warn 'Could not append to deployment/history.tsv.'
+    fi
+    summary
+    exit "$code"
+}
+on_error() {
+    local code=$1 line=$2 command=$3
+    case "${FUNCNAME[1]:-}" in
+        run|capture)
+            command=$last_command
+            line=${BASH_LINENO[1]:-$line}
+            ;;
+        require|probe|ready_revision|verify_traffic)
+            if [[ $command == 'return 1' ]]; then command=$last_command; fi
+            ;;
+        *)
+            if [[ $command == 'return 1' && -n $reason ]]; then command='Release validation'; fi
+            ;;
+    esac
+    error "Step $step (${DESCRIPTIONS[step-1]:-initialization}) failed after $(duration "$((SECONDS-step_start))")."
+    error "Line $line, exit $code, command: $command"
+    error "${reason:-The command failed. Review its output in the step above.}"
+    exit "$code"
+}
+require() {
+    local detail=$1
+    shift
+    if ! "$@"; then
+        printf -v last_command '%q ' "$@"
+        fail "$detail"
+    fi
+}
+check_disk() {
+    local available
+    available=$(df -Pk "$1" | awk 'NR == 2 {print $4}')
+    [[ $available =~ ^[0-9]+$ ]] && (( available >= MIN_DISK_KIB ))
+}
+registry_tags() {
+    capture "$tmp/registry.tsv" cloud artifacts docker tags list "$IMAGE" \
+        '--format=value(tag.basename(),version.basename())'
+}
+registry_digest() {
+    awk -F '\t' -v tag="$1" '$1 == tag { print $2 }' "$tmp/registry.tsv"
+}
+create_registry_tag() {
+    local alias=$1
+    last_command="Artifact Registry create-only tag $IMAGE:$alias at $digest"
+    info "$ $last_command"
+    python3 - "$PROJECT" "$REGION" "$REPOSITORY" "$IMAGE_NAME" "$alias" "$digest" <<'PYTHON'
+import http.client
+import json
+import subprocess
+import sys
+from urllib.parse import urlencode
+
+project, region, repository, image, tag, digest = sys.argv[1:]
+parent = f"projects/{project}/locations/{region}/repositories/{repository}/packages/{image}"
+# Keep the access token in memory and out of argv, the terminal and deployment logs.
+try:
+    token = subprocess.check_output(
+        ["gcloud", "auth", "print-access-token", f"--project={project}", "--quiet"],
+        text=True, stderr=subprocess.DEVNULL, timeout=30,
+    ).strip()
+except (subprocess.SubprocessError, OSError):
+    sys.exit("Could not obtain credentials for Artifact Registry tag creation")
+connection = http.client.HTTPSConnection("artifactregistry.googleapis.com", timeout=30)
+try:
+    connection.request(
+        "POST", f"/v1/{parent}/tags?{urlencode({'tagId': tag})}",
+        json.dumps({"name": f"{parent}/tags/{tag}", "version": f"{parent}/versions/{digest}"}),
+        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    if response.status == 409:
+        print(f"Tag {tag} already exists; checking its digest.")
+    elif response.status in (200, 201):
+        print(f"Created tag {tag}.")
+    else:
+        sys.exit(f"Artifact Registry tag creation failed for {tag} (HTTP {response.status})")
+except (OSError, http.client.HTTPException):
+    sys.exit(f"Could not complete Artifact Registry tag creation for {tag}; retry to check its digest")
+finally:
+    connection.close()
+PYTHON
+}
+next_minor() {
+    local major minor
+    IFS=. read -r major minor _ <<< "$1"
+    printf '%s.%s.0\n' "$major" "$((minor+1))"
+}
+image_label() {
+    docker image inspect --format "{{with .Config.Labels}}{{index . \"$oci.$2\"}}{{end}}" "$1"
+}
+load_image() {
+    run docker pull --platform linux/amd64 "$IMAGE@$1"
+}
+
+# Accept an HTTPS origin, with an optional trailing slash; credentials, paths
+# and query strings are excluded from the probe target and deployment logs.
+if [[ ! $PUBLIC_APP_URL =~ ^https://[a-zA-Z0-9.-]+(:[0-9]{1,5})?$ ]]; then
+    error 'Set PUBLIC_APP_URL to an HTTPS origin, for example https://fashionlens.cloud.run.'
+    exit 2
+fi
+
+if (( dry_run )); then
+    info "Public verification URL: $PUBLIC_APP_URL"
+    info "Dry run for origin/$BRANCH → $IMAGE → $SERVICE ($REGION, port $PORT)."
+    info 'Source, serving version and next release are resolved during execution.'
+    if (( force )); then info 'Force mode will redeploy a verified existing image if the commit already serves.'; fi
+    for ((i=1; i<=TOTAL; i++)); do begin "$i"; done
+    exit 0
+fi
+
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+trap 'reason="Interrupted"; on_error 130 "$LINENO" "SIGINT"' INT
+trap 'reason="Terminated"; on_error 143 "$LINENO" "SIGTERM"' TERM
+trap shutdown EXIT
+step=1
+for tool in git flock tee mktemp mkdir date; do
+    require "Install $tool and add it to PATH." command -v "$tool" >/dev/null
+done
+root=$(git rev-parse --show-toplevel)
+require 'Run ./deploy-fashion-gcp from the Fashion Lens repository root.' test "$PWD" = "$root"
+require 'This does not look like the Fashion Lens repository.' test -f streamlit_app.py
+for component in "$PROJECT" "$REGION" "$REPOSITORY" "$IMAGE_NAME" "$SERVICE"; do
+    require 'GCP names must contain only lowercase letters, digits and hyphens.' test -n "$component"
+    [[ $component =~ ^[a-z0-9][a-z0-9-]*$ ]] || fail "Invalid GCP deployment name: $component"
+done
+for number in "$PORT" "$MIN_DISK_KIB" "$PROBE_ATTEMPTS" "$PROBE_INTERVAL"; do
+    [[ $number =~ ^(0|[1-9][0-9]{0,11})$ ]] || fail 'Numeric overrides must be nonnegative decimal integers.'
+done
+(( PORT >= 1 && PORT <= 65535 && PROBE_ATTEMPTS >= 1 )) || fail 'Set a valid port and at least one probe attempt.'
+require 'Set a valid FASHION_GIT_BRANCH.' git check-ref-format "refs/heads/$BRANCH"
+git_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+exec {lock_fd}>"$git_dir/fashion-deploy.lock"
+require 'Another Fashion Lens deployment holds the local lock.' flock -n "$lock_fd"
+mkdir -p "$root/deployment/logs"
+log_file=$(mktemp "$root/deployment/logs/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.log")
+exec > >(tee -a "$log_file") 2>&1
+logged=1
+begin 1
+for tool in docker uv gcloud python3 curl timeout tar awk df cp rm sort sleep realpath cat chmod; do
+    require "Install $tool and add it to PATH." command -v "$tool" >/dev/null
+done
+export GIT_TERMINAL_PROMPT=0
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+tmp=$(mktemp -d)
+for file in Dockerfile .dockerignore pyproject.toml uv.lock data/catalog.db data/embeddings/clip_catalog.npz; do
+    [[ -s $file && ! -L $file ]] || fail "Missing or invalid $file. Prepare deployment artifacts using the README."
+done
+shopt -s nullglob
+images=(data/images/*.jpg)
+(( ${#images[@]} > 0 )) || fail 'Generate catalog images using the README.'
+model_cache=deployment/hf-cache/hub/models--openai--clip-vit-base-patch32
+require 'Populate deployment/hf-cache with the pretrained CLIP model using the README.' test -s "$model_cache/refs/main"
+model_ref=$(<"$model_cache/refs/main")
+[[ $model_ref =~ ^[0-9a-f]{40}$ ]] || fail 'The model cache refs/main must contain a Hugging Face commit SHA.'
+model_snapshot="$model_cache/snapshots/$model_ref"
+[[ -s $model_snapshot/config.json && ( -s $model_snapshot/model.safetensors || -s $model_snapshot/pytorch_model.bin ) ]] ||
+    fail 'The deployment CLIP snapshot is missing its configuration or weights.'
+require 'Free disk space in the repository filesystem or adjust FASHION_MIN_DISK_KIB.' check_disk "$root"
+require 'Free disk space in the temporary filesystem or adjust FASHION_MIN_DISK_KIB.' check_disk "$tmp"
+require 'Start Docker and ensure your user can access its daemon.' run docker info --format '{{.ServerVersion}}'
+require 'Sign in with gcloud auth login or configure an authorized workload identity.' \
+    capture /dev/null cloud auth print-access-token
+require "Grant access to GCP project $PROJECT." run cloud projects describe "$PROJECT" '--format=value(projectId)'
+require "Check access to the existing registry repository $REPOSITORY." \
+    run cloud artifacts repositories describe "$REPOSITORY" "--location=$REGION" '--format=value(name)'
+require "Check access to the existing Cloud Run service $SERVICE." service_snapshot "$tmp/preflight.json"
+configured_port=$(read_cloud port "$tmp/preflight.json")
+[[ $configured_port == "$PORT" ]] || fail "Service uses port $configured_port. Set FASHION_CONTAINER_PORT to match."
+python3 - "${DOCKER_CONFIG:-$HOME/.docker}/config.json" "$REGISTRY" <<'PY' || fail "Configure Docker for $REGISTRY with gcloud auth configure-docker $REGISTRY."
+import json
+import sys
+path, registry = sys.argv[1:]
+try:
+    with open(path) as file:
+        config = json.load(file)
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(not (config.get("credsStore") or config.get("credHelpers", {}).get(registry)
+              or config.get("auths", {}).get(registry)))
+PY
+done_step
+
+begin 2
+# Resolve Git URL rewrites too. An SSH or credential-helper HTTPS remote keeps
+# embedded credentials out of Git diagnostics and OCI metadata.
+fetch_url=$(git remote get-url origin)
+push_url=$(git remote get-url --push origin)
+safe_remote='^(https://[a-zA-Z0-9.-]+(:[0-9]+)?/|ssh://([a-zA-Z0-9._-]+@)?[a-zA-Z0-9.-]+(:[0-9]+)?/|[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+:)[a-zA-Z0-9._/-]+$'
+[[ $fetch_url =~ $safe_remote && $push_url =~ $safe_remote ]] ||
+    fail 'Configure origin with a credential-free HTTPS URL or an SSH URL before deploying.'
+case "$fetch_url" in
+    https://*) source_url=$fetch_url ;;
+    ssh://*) source_url=${fetch_url#ssh://}; source_url="https://${source_url##*@}" ;;
+    *) source_url=${fetch_url#*@}; source_url="https://${source_url/:/\/}" ;;
+esac
+[[ -z $(git status --porcelain=v1 --untracked-files=no) ]] ||
+    fail 'Tracked files have local changes. Commit and push them or use a separate clean checkout.'
+run timeout 180 git fetch --tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+sha=$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}")
+require 'HEAD has commits absent from the deploy branch. Push them or use a clean deploy checkout.' \
+    git merge-base --is-ancestor HEAD "$sha"
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    require "Local $BRANCH has commits absent from origin/$BRANCH. Push them before deploying." \
+        git merge-base --is-ancestor "refs/heads/$BRANCH" "$sha"
+fi
+message=$(git show -s --format=%s "$sha")
+run git log -1 --format='%h %s (%cI)' "$sha"
+run git diff --check
+run git diff-tree --root -m --check "$sha" --
+done_step
+
+begin 3
+service_snapshot "$tmp/original.json"
+old_traffic=$(read_cloud traffic "$tmp/original.json")
+cloud_run_url=$(read_cloud url "$tmp/original.json")
+old_service_uid=$(read_cloud uid "$tmp/original.json")
+old_generation=$(read_cloud generation "$tmp/original.json")
+[[ $cloud_run_url == https://* && -n $old_service_uid && -n $old_generation ]] ||
+    fail 'Could not capture the existing service identity, generation and HTTPS URL.'
+[[ $(read_cloud ready "$tmp/original.json") == True ]] || fail 'The existing service must be ready before a release.'
+[[ $(read_cloud port "$tmp/original.json") == "$PORT" ]] || fail 'The existing container port changed during preflight.'
+# A traffic split has no single previous application version. Use the largest
+# share (stable name tie-break), while preserving every share for rollback.
+previous_revision=$(printf '%s\n' "${old_traffic//,/$'\n'}" | sort -t= -k2,2nr -k1,1 | awk -F= 'NR == 1 {print $1}')
+revision_snapshot "$previous_revision" "$tmp/previous.json"
+old_digest=$(read_cloud digest "$tmp/previous.json")
+previous_image=$(read_cloud image "$tmp/previous.json")
+[[ $old_digest =~ $digest_pattern && ( $previous_image == "$IMAGE:"* || $previous_image == "$IMAGE@"* ) ]] ||
+    fail 'The primary serving revision has no verified digest in the configured registry image.'
+registry_tags
+load_image "$old_digest"
+previous_version=$(image_label "$IMAGE@$old_digest" version)
+previous_sha=$(image_label "$IMAGE@$old_digest" revision)
+if [[ -z $previous_version ]]; then
+    version_file="$tmp/baselines"
+    awk -F '\t' -v digest="$old_digest" '$2 == digest {print $1}' "$tmp/registry.tsv" > "$version_file"
+    baselines=()
+    while IFS= read -r value; do
+        if [[ $value =~ $semver ]]; then baselines+=("$value"); fi
+    done < "$version_file"
+    (( ${#baselines[@]} == 1 )) || fail 'The deployed digest must have exactly one numeric registry tag when it has no OCI version.'
+    previous_version=${baselines[0]}
+fi
+[[ $previous_version =~ $semver && $(registry_digest "$previous_version") == "$old_digest" ]] ||
+    fail 'The deployed image version and registry version tag disagree.'
+[[ -z $previous_sha || $previous_sha =~ ^[0-9a-f]{40}$ ]] ||
+    fail 'The deployed image has an invalid OCI revision.'
+latest_git=
+git tag -l --sort=-version:refname 'v*' > "$tmp/tags"
+while IFS= read -r value; do
+    if [[ ${value#v} =~ $semver ]]; then latest_git=${value#v}; break; fi
+done < "$tmp/tags"
+candidate=$(next_minor "$previous_version")
+version=$candidate
+digest=$(registry_digest "$candidate")
+if [[ -n $latest_git && $latest_git != "$previous_version" ]]; then
+    if [[ $previous_sha != "$sha" || $(next_minor "$latest_git") != "$previous_version" ]]; then
+        fail "Latest Git release v$latest_git conflicts with serving version $previous_version."
+    fi
+    warn 'Serving image is one minor release ahead of Git. Attempting to finalize the verified release.'
+fi
+if [[ -n $latest_git && $latest_git == "$previous_version" && -n $previous_sha ]]; then
+    [[ $(git rev-parse "refs/tags/v$latest_git^{commit}") == "$previous_sha" ]] ||
+        fail "Git tag v$latest_git conflicts with the serving image's OCI revision."
+fi
+while IFS=$'\t' read -r value _; do
+    if [[ $value =~ $semver && $value != "$candidate" && $value != "$previous_version" ]]; then
+        highest=$(printf '%s\n%s\n' "$value" "$previous_version" | LC_ALL=C sort -V | awk 'END {print}')
+        [[ $highest == "$previous_version" ]] || fail "Registry version $value is ahead of both production and candidate $candidate."
+    fi
+done < "$tmp/registry.tsv"
+
+recovering=0
+if [[ $previous_sha == "$sha" ]]; then
+    version=$previous_version
+    digest=$old_digest
+    [[ $(registry_digest "$sha") == "$digest" ]] || fail 'The serving image is missing its exact-commit registry tag or the tag points elsewhere.'
+    if (( ! force )); then recovering=1; fi
+elif [[ -n $(registry_digest "$sha") && $(registry_digest "$sha") != "$digest" ]]; then
+    fail 'The exact-commit registry tag is already bound to a different release. Inspect the registry before retrying.'
+fi
+registered_digest=$(registry_digest "$version")
+upload_prefix="candidate-$version-$sha-"
+if [[ -z $digest ]]; then
+    # Recover an upload that completed before its version alias was created.
+    digest=$(awk -F '\t' -v prefix="$upload_prefix" 'index($1, prefix) == 1 { print $2 }' \
+        "$tmp/registry.tsv" | sort -u)
+    if [[ -n $digest && ! $digest =~ $digest_pattern ]]; then
+        fail "Registry has conflicting candidate uploads for $version and $sha."
+    fi
+fi
+tag="v$version"
+marker="$version ${sha:0:12}"
+info "Previous release $previous_version ($previous_revision, $old_digest); selected $version for $sha."
+done_step
+
+publish_tag() {
+    local remote_tag
+    run timeout 120 git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" > "$tmp/remote-tag"
+    remote_tag=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}' "$tmp/remote-tag")
+    if [[ $remote_tag == "$sha" ]]; then
+        tag_status='Already published'
+        return 0
+    fi
+    [[ ! -s $tmp/remote-tag ]] || fail "Remote $tag already exists and does not resolve to $sha as an annotated tag."
+    if git show-ref --verify --quiet "refs/tags/$tag"; then
+        [[ $(git cat-file -t "refs/tags/$tag") == tag && $(git rev-parse "$tag^{commit}") == "$sha" ]] ||
+            fail "Local $tag conflicts with the verified release."
+    else
+        tag_status='Creation failed'
+        run git tag -a "$tag" "$sha" -m "Fashion Lens $version ($digest)"
+    fi
+    tag_status='Push failed'
+    run timeout 180 git push origin "refs/tags/$tag:refs/tags/$tag"
+    tag_status='Pushed'
+}
+
+if (( recovering )); then
+    revision=$previous_revision
+    [[ $old_traffic == "$revision=100" ]] || fail 'An already-serving commit has split traffic. Use --force to explicitly redeploy it at 100%.'
+    ready_revision "$revision" "$digest"
+    verify_traffic "$revision=100"
+    probe "$PUBLIC_APP_URL" "$marker"
+    traffic=100%
+    health='HTTP, Streamlit health and release identity verified'
+    functional='Existing release; search tests not rerun'
+    deployed=1
+    begin 10
+    publish_tag
+    if [[ $tag_status == 'Already published' ]]; then
+        duplicate=1
+        success "$sha is already successfully deployed as $version."
+    fi
+    outcome=SUCCESS
+    if (( ! duplicate )); then record_history; history_written=1; fi
+    done_step
+    exit 0
+fi
+
+begin 4
+stage="$tmp/source"
+run mkdir -p "$stage"
+# Export only the committed build inputs. Ignore unrelated files in the checkout.
+run git archive --output="$tmp/source.tar" "$sha" -- \
+    Dockerfile .dockerignore .python-version .streamlit pyproject.toml uv.lock app ui scripts streamlit_app.py
+run tar -xf "$tmp/source.tar" -C "$stage"
+for file in "${images[@]}"; do
+    [[ -s $file && ! -L $file ]] || fail "Invalid generated catalog image: $file"
+done
+run mkdir -p "$stage/data/images" "$stage/data/embeddings" \
+    "$stage/$model_cache/refs" "$stage/$model_snapshot"
+run cp data/catalog.db "$stage/data/"
+run cp data/embeddings/clip_catalog.npz "$stage/data/embeddings/"
+info "Copying ${#images[@]} catalog images into the staged build context."
+cp "${images[@]}" "$stage/data/images/"
+run cp "$model_cache/refs/main" "$stage/$model_cache/refs/"
+# Flatten the selected Hugging Face snapshot, copying only files CLIP consumes.
+# This avoids copying cache tokens, another model, or unrelated snapshots.
+for name in config.json preprocessor_config.json processor_config.json tokenizer.json \
+    tokenizer_config.json special_tokens_map.json added_tokens.json vocab.json merges.txt \
+    model.safetensors pytorch_model.bin; do
+    file="$model_snapshot/$name"
+    if [[ -e $file ]]; then
+        resolved=$(realpath -e "$file")
+        [[ $resolved == "$root/$model_snapshot/"* || $resolved == "$root/$model_cache/blobs/"* ]] ||
+            fail "Unexpected target for Hugging Face snapshot file $file."
+        run cp -L "$file" "$stage/$model_snapshot/$name"
+    fi
+done
+export HF_HOME="$stage/deployment/hf-cache"
+export HF_HUB_CACHE="$HF_HOME/hub" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+export UV_PROJECT_ENVIRONMENT="$tmp/venv"
+cd "$stage"
+run uv lock --check
+run timeout 1200 uv sync --locked
+cat > "$tmp/check-catalog.py" <<'PY'
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+
+with sqlite3.connect("file:data/catalog.db?mode=ro", uri=True) as db:
+    if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
+        raise SystemExit("SQLite catalog failed its integrity check")
+    products = db.execute("SELECT id, image_path FROM products").fetchall()
+if not products or any(path != f"data/images/{product_id}.jpg" or not Path(path).is_file()
+                       for product_id, path in products):
+    raise SystemExit("Catalog has missing or unexpected product image paths")
+with np.load("data/embeddings/clip_catalog.npz", allow_pickle=False) as index:
+    ids = index["product_ids"]
+    vectors = index["embeddings"]
+    if (ids.ndim != 1 or sorted(ids.tolist()) != sorted(i for i, _ in products)
+            or vectors.shape != (len(ids), 512) or not np.isfinite(vectors).all()
+            or not np.allclose(np.linalg.norm(vectors, axis=1), 1, atol=1e-4)):
+        raise SystemExit("Catalog embeddings must match the product IDs and be finite unit vectors")
+print(f"Catalog and embeddings agree on {len(products)} product IDs and images")
+PY
+run timeout 120 uv run --locked --no-sync python "$tmp/check-catalog.py"
+
+verify_smoke_output() {
+    if ! awk '
+        /^SEARCH MODE: / { mode = $3 }
+        /^Results: [1-9][0-9]*$/ { seen[mode] = 1 }
+        END { exit !(seen["KEYWORD"] && seen["FUZZY"] && seen["SEMANTIC"] &&
+                     seen["HYBRID"] && seen["VISUAL"] && seen["MULTIMODAL"]) }
+    ' "$1"; then
+        fail 'The existing smoke test did not report results for all six search modes.'
+    fi
+}
+smoke() {
+    local result=$1 status=0
+    shift
+    run "$@" > "$result" 2>&1 || status=$?
+    cat "$result"
+    if (( status )); then
+        reason="Search smoke test exited with status $status."
+        return "$status"
+    fi
+    verify_smoke_output "$result"
+}
+smoke "$tmp/host-smoke.log" timeout 300 uv run --locked --no-sync python -m scripts.test_search_engine
+functional='All six modes verified against staged source with offline CLIP'
+done_step
+
+begin 5
+if [[ -n $digest ]]; then
+    [[ $digest =~ $digest_pattern ]] || fail 'Artifact Registry returned an invalid candidate digest.'
+    load_image "$digest"
+    local_image="$IMAGE@$digest"
+    [[ $(image_label "$local_image" revision) == "$sha" && $(image_label "$local_image" version) == "$version" ]] ||
+        fail "Registry version $version belongs to another commit or lacks matching OCI metadata. Resolve the collision before retrying."
+    warn "Reusing the previously published candidate $digest."
+else
+    # Keep the committed Dockerfile instructions and append only the generated
+    # static release marker layer to the staged copy. It contains public metadata.
+    printf '%s\n' "$marker" > .fashionlens-release.txt
+    # The stage is private, but the image runs as the Dockerfile's non-root user.
+    run chmod -R a+rX "$stage"
+    printf '\nENV STREAMLIT_SERVER_ENABLE_STATIC_SERVING=true\nCOPY .fashionlens-release.txt /app/static/fashionlens-release.txt\n' >> Dockerfile
+    local_image="fashionlens-deploy:$sha"
+    run docker build --platform linux/amd64 --provenance=false --tag "$local_image" \
+        --label "$oci.version=$version" --label "$oci.revision=$sha" \
+        --label "$oci.created=$(date -u +%FT%TZ)" --label "$oci.source=$source_url" .
+fi
+run docker image inspect --format 'Image ID={{.Id}} Size={{.Size}} bytes Platform={{.Os}}/{{.Architecture}}' "$local_image"
+[[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$local_image") == linux/amd64 ]] ||
+    fail 'The candidate image is not linux/amd64.'
+info "Image version $version | commit $sha"
+done_step
+
+begin 6
+nonce=${tmp##*.}
+nonce=${nonce,,}
+web_container="fashionlens-web-$nonce"
+smoke_container="fashionlens-smoke-$nonce"
+run docker run --detach --name "$web_container" --label "com.fashionlens.deployment=$nonce" \
+    --publish "127.0.0.1::$PORT" --env "PORT=$PORT" "$local_image"
+binding=$(docker port "$web_container" "$PORT/tcp")
+if ! probe "http://$binding" "$marker"; then
+    failed_probe=$last_command
+    run docker logs --tail 80 "$web_container" || warn 'Could not read the local web container logs.'
+    on_error 1 "$LINENO" "$failed_probe"
+fi
+smoke "$tmp/container-smoke.log" timeout 300 docker run --rm --network none \
+    --name "$smoke_container" --label "com.fashionlens.deployment=$nonce" \
+    "$local_image" python -m scripts.test_search_engine
+run docker rm -f "$web_container"
+web_container=
+smoke_container=
+functional='All six modes passed on staged source and inside the image with networking disabled'
+done_step
+cd "$root"
+
+begin 7
+registry_tags
+observed=$(registry_digest "$version")
+[[ $observed == "$registered_digest" ]] ||
+    fail "Registry version $version changed while preparing the image. Inspect the release and retry."
+commit_digest=$(registry_digest "$sha")
+[[ -z $commit_digest || ( -n $digest && $commit_digest == "$digest" ) ]] ||
+    fail "Registry commit tag $sha already points to a different image."
+if [[ -z $digest ]]; then
+    # Upload under a unique transport tag. Create the public aliases with the
+    # create-only API so even a competing writer cannot make us overwrite one.
+    upload_tag="$upload_prefix$nonce"
+    run docker tag "$local_image" "$IMAGE:$upload_tag"
+    if run docker push "$IMAGE:$upload_tag" > "$tmp/push.log" 2>&1; then
+        cat "$tmp/push.log"
+    else
+        push_status=$?
+        cat "$tmp/push.log"
+        reason="Docker could not upload $upload_tag. Check Artifact Registry access."
+        on_error "$push_status" "$LINENO" "$last_command"
+    fi
+    digest=$(awk '/ digest: sha256:/ { print $(NF-2) }' "$tmp/push.log")
+    [[ $digest =~ $digest_pattern ]] || fail 'Docker push did not report a single valid digest.'
+    registry_tags
+    [[ $(registry_digest "$upload_tag") == "$digest" ]] ||
+        fail 'Artifact Registry upload tag does not match the pushed image digest.'
+fi
+if [[ -z $registered_digest ]]; then create_registry_tag "$version"; fi
+registry_tags
+[[ $(registry_digest "$version") == "$digest" ]] ||
+    fail "Artifact Registry version $version is bound to another digest."
+commit_digest=$(registry_digest "$sha")
+if [[ -z $commit_digest ]]; then
+    create_registry_tag "$sha"
+elif [[ $commit_digest != "$digest" ]]; then
+    fail "Commit tag $sha was claimed by a different image; inspect the registry."
+fi
+registry_tags
+[[ $(registry_digest "$version") == "$digest" && $(registry_digest "$sha") == "$digest" ]] ||
+    fail 'The uploaded release and exact-commit tags do not resolve to the same verified digest.'
+info "Verified immutable image $IMAGE@$digest."
+done_step
+
+begin 8
+verify_traffic "$old_traffic"
+[[ $(read_cloud generation "$tmp/service.json") == "$old_generation" ]] ||
+    fail 'The service configuration changed during the build. Inspect it and retry.'
+suffix="v${version//./-}-${nonce:0:8}"
+revision="$SERVICE-$suffix"
+preview_tag="candidate-${nonce:0:12}"
+(( ${#revision} <= 63 )) || fail 'Service name and version produce a Cloud Run revision name longer than 63 characters.'
+preview_requested=1
+run timeout 900 gcloud run services update "$SERVICE" --image="$IMAGE@$digest" \
+    --no-traffic --revision-suffix="$suffix" --tag="$preview_tag" \
+    --region="$REGION" --project="$PROJECT" --quiet
+ready_revision "$revision" "$digest"
+verify_traffic "$old_traffic"
+preview_generation=$(read_cloud generation "$tmp/service.json")
+preview_url=$(read_cloud tag-url "$tmp/service.json" "$preview_tag" "$revision")
+[[ $preview_url == https://* ]] || fail 'Cloud Run did not report the preview URL for the new revision.'
+probe "$preview_url" "$marker"
+startup_logs
+done_step
+
+begin 9
+verify_traffic "$old_traffic"
+[[ $(read_cloud generation "$tmp/service.json") == "$preview_generation" ]] ||
+    fail 'Service configuration changed during preview validation. Inspect it and retry.'
+traffic_requested=1
+run timeout 900 gcloud run services update-traffic "$SERVICE" --to-revisions="$revision=100" \
+    --region="$REGION" --project="$PROJECT" --quiet
+verify_traffic "$revision=100"
+ready_revision "$revision" "$digest"
+probe "$PUBLIC_APP_URL" "$marker"
+startup_logs
+remove_preview
+verify_traffic "$revision=100"
+probe "$PUBLIC_APP_URL" "$marker"
+traffic=100%
+health='HTTP, Streamlit health, release identity and Cloud Run readiness verified'
+deployed=1
+done_step
+
+begin 10
+publish_tag
+outcome=SUCCESS
+record_history
+history_written=1
+done_step

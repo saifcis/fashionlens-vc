@@ -4,6 +4,8 @@
 
 Fashion Lens is an independent engineering portfolio project inspired by fashion resale marketplaces. It combines keyword, fuzzy, semantic, visual, hybrid and multimodal search in a browser-based product discovery interface. The Engineering Lab lets users compare search modes, inspect results and measure query latency.
 
+**[Live Demo](https://fashionlens.cloud.run/)**
+
 ## Features
 
 | Search mode | Description | Example |
