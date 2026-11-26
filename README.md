@@ -2,15 +2,7 @@
 
 **Multimodal Fashion Search & Discovery Engine**
 
-Fashion Lens is an independent engineering portfolio project exploring modern fashion discovery through keyword search, visual similarity, semantic retrieval and multimodal machine learning.
-
-Inspired by fashion resale marketplaces, the project demonstrates how traditional search techniques and pretrained ML models can work together to create an intelligent product discovery experience.
-
-## Overview
-
-Fashion Lens provides a browser-based product discovery interface and an Engineering Lab for comparing search mechanisms, inspecting retrieved products and measuring execution latency.
-
-The project focuses on practical ML integration, search architecture, relevance, performance, reproducibility and operational efficiency. It uses pretrained models rather than external paid inference APIs.
+Fashion Lens is an independent engineering portfolio project inspired by fashion resale marketplaces. It combines keyword, fuzzy, semantic, visual, hybrid and multimodal search in a browser-based product discovery interface. The Engineering Lab lets users compare search modes, inspect results and measure query latency.
 
 ## Features
 
@@ -27,14 +19,10 @@ Weighted embedding fusion is experimental. A request such as “the same bag but
 
 ## Discovery
 
-- Interactive browser-based product search.
 - Six selectable search modes, with Hybrid selected by default.
-- Image upload for visual and multimodal queries.
-- Configurable image/text weighting and result count.
-- Browsable catalog with category navigation and filters for gender, category, article type, and colour.
-- Filters apply before the result limit across all search modes.
-- Responsive grid with product photographs, names, article types, and colours.
-- Marketplace-inspired presentation, with Fashion Lens branding.
+- Image uploads, configurable image/text weighting and result counts.
+- Category navigation and filters for gender, category, article type and colour. Filters apply before the result limit in all modes.
+- Responsive product grid with photos, names, article types and colours.
 
 ## Architecture
 
@@ -73,7 +61,7 @@ flowchart TD
 | Reciprocal Rank Fusion | Combine ranked lists without assuming that BM25 and cosine scores are directly comparable. |
 | Reusable search engine | Keep retrieval and ML logic independent of Streamlit, enabling future UI or API migration. |
 | Model caching | Reuse the loaded model across searches within an application process. |
-| uv and dependency locking | Improve repeatability of Python environments and future container builds. |
+| uv and dependency locking | Improve repeatability of Python environments and container builds. |
 
 ## Technology stack
 
@@ -82,94 +70,61 @@ flowchart TD
 | Language | Python 3.12 |
 | Dependency management | uv / pyproject.toml / uv.lock |
 | UI | Streamlit |
-| ML runtime | PyTorch (CPU) |
-| Model integration | Hugging Face Transformers |
-| Baseline model | openai/clip-vit-base-patch32 |
+| ML | PyTorch (CPU), Hugging Face Transformers, openai/clip-vit-base-patch32 |
 | Image processing | Pillow |
 | Dataset ingestion | Hugging Face Datasets |
-| Product storage | SQLite |
-| Lexical retrieval | SQLite FTS5 / BM25 |
-| Fuzzy matching | RapidFuzz |
-| Vector storage | NumPy NPZ |
-| Vector retrieval | Exact dot-product search over normalized vectors |
+| Catalog and text search | SQLite, FTS5 / BM25, RapidFuzz |
+| Vector search | NumPy NPZ, exact dot-product search over normalized vectors |
 | Analysis | pandas / NumPy |
 | Version control | Git / GitHub |
-| Planned hosting | Docker / Google Cloud Run |
+| Containerization | Docker |
+| Hosting | Google Cloud Run |
 
-## Dataset and baseline measurements
+## Dataset and model
 
-The initial import uses a seeded sample of 1,000 products. The figures below are historical local measurements. [Fashion Product Images Small dataset](https://huggingface.co/datasets/ashraq/fashion-product-images-small)
-
-| Metric | Initial local result |
-| --- | --- |
-| Imported products | 1,000 |
-| Product images | 1,000 |
-| SQLite catalog size before text indexing | 132 KB |
-| Initial catalog and image storage | 4.1 MB |
-| CLIP model parameters | 151,277,313 |
-| Embedding dimensions | 512 |
-| Model weights file | Approximately 605 MB |
-| Peak process RAM during initial model loading | Approximately 1.19 GiB |
-| Initial measured model loading time | 70.59 s (includes download work) |
-| Initial total process elapsed time | 145.10 s |
-| Raw float32 vector matrix size (1,000 × 512) | Approximately 1.95 MiB (calculated) |
-
-Measurements were obtained locally on WSL Ubuntu 24.04 using CPU execution. Initial loading measurements include download and caching overhead and describe first-time model preparation. Cloud resource requirements and formal search benchmarks remain to be validated.
-
-The source dataset contains low-resolution product images. Public deployment depends on confirming the applicable dataset and image redistribution rights.
+The catalog uses a seeded sample of 1,000 products from the [Fashion Product Images Small dataset](https://huggingface.co/datasets/ashraq/fashion-product-images-small). Pretrained CLIP generates 512-dimensional catalog image embeddings offline. At search time, CLIP encodes text or uploaded images on CPU and compares the resulting vectors with the catalog embeddings. Changing the embedding model requires regenerating the catalog vectors.
 
 ## Getting started
 
-### Prerequisites
-
-- Linux or WSL Ubuntu (the initial target environment)
-- Python 3.12
-- Git
-- uv
-- Internet access for the initial dependency, dataset and model downloads
-- Sufficient RAM and disk space for CPU inference and local model caching
-
-### 1. Clone the repository
-
-Clone the repository and run the remaining commands from its root.
+Use Linux or WSL with Git, Python 3.12, uv and internet access for the initial downloads. After cloning, run the remaining commands from the repository root.
 
 ```bash
 git clone git@github.com:saifcis/fashionlens-vc.git fashionlens
 cd fashionlens
-```
-
-### 2. Install dependencies
-
-```bash
 uv sync --locked
 ```
 
-The Linux configuration uses the CPU-only PyTorch package index. The lockfile pins Python dependencies. Model and dataset revision pinning is on the roadmap.
-
-### 3. Prepare the catalog and model
+Prepare the SQLite catalog, lexical index, CLIP cache and catalog embeddings. Keep the same shell for the subsequent commands so the app can find the cached model.
 
 ```bash
 uv run --locked python -m scripts.import_catalog
+export HF_HOME="$PWD/deployment/hf-cache"
 uv run --locked python -m scripts.load_model
 uv run --locked python -m scripts.build_text_index
 uv run --locked python -m scripts.build_embeddings
 ```
 
-These commands import the product catalog, download/cache CLIP, build the lexical index and generate catalog image embeddings. The model is downloaded during preparation because the search provider uses locally cached weights at runtime.
-
-### 4. Run the search smoke test
+Run the search smoke test and launch the local app.
 
 ```bash
 uv run --locked python -m scripts.test_search_engine
-```
-
-### 5. Launch Fashion Lens
-
-```bash
 uv run --locked streamlit run streamlit_app.py
 ```
 
-Open [Discovery](http://localhost:8501/) or go directly to [Engineering Lab](http://localhost:8501/engineering-lab).
+Open [Discovery](http://localhost:8501/) or the [Engineering Lab](http://localhost:8501/engineering-lab).
+
+## Docker and deployment
+
+Fashion Lens is packaged with Docker and has been deployed publicly on Google Cloud Run. The image installs dependencies from `uv.lock` and bundles the SQLite catalog, product images, embeddings and pretrained CLIP weights for offline CPU inference.
+
+With Docker installed, complete the catalog and model preparation above, then build and run the image from the repository root.
+
+```bash
+docker build -t fashionlens:local .
+docker run --rm -p 127.0.0.1:8080:8080 fashionlens:local
+```
+
+Open [Fashion Lens locally](http://localhost:8080/).
 
 ## Command-line search examples
 
@@ -177,96 +132,50 @@ Open [Discovery](http://localhost:8501/) or go directly to [Engineering Lab](htt
 uv run --locked python -m scripts.search_text --mode keyword --query "black handbag"
 uv run --locked python -m scripts.search_text --mode fuzzy --query "blak handbg"
 uv run --locked python -m scripts.search_demo --text "black leather handbag"
-```
-
-For visual search, replace `PRODUCT_ID.jpg` with an existing local JPEG filename.
-
-```bash
 uv run --locked python -m scripts.search_demo --image data/images/PRODUCT_ID.jpg
 ```
+
+Replace `PRODUCT_ID.jpg` with an existing catalog image filename.
 
 ## Project structure
 
 ```text
 fashionlens/
-├── app/
-│   ├── embeddings/
-│   │   └── clip_provider.py
-│   └── search/
-│       ├── catalog.py
-│       ├── engine.py
-│       ├── keyword_search.py
-│       ├── fuzzy_search.py
-│       ├── vector_search.py
-│       └── hybrid_search.py
-├── scripts/
-│   ├── explore_dataset.py
-│   ├── import_catalog.py
-│   ├── load_model.py
-│   ├── generate_embedding.py
-│   ├── compare_images.py
-│   ├── build_embeddings.py
-│   ├── build_text_index.py
-│   ├── search_demo.py
-│   ├── search_text.py
-│   └── test_search_engine.py
-├── ui/
-│   ├── components.py
-│   ├── discovery.py
-│   ├── engineering_lab.py
-│   └── styles.css
-├── data/                     # Local generated data
-│   ├── catalog.db
-│   ├── images/
-│   └── embeddings/
-├── .streamlit/
-│   └── config.toml
+├── app/                 # Search engine and CLIP integration
+├── ui/                  # Discovery and Engineering Lab
+├── scripts/             # Catalog preparation, demos and smoke test
+├── data/                # Generated catalog, images and embeddings
+├── deployment/          # Local model cache used by Docker
+├── .streamlit/          # Streamlit settings
 ├── streamlit_app.py
 ├── pyproject.toml
 ├── uv.lock
-└── README.md
+├── Dockerfile
+└── .dockerignore
 ```
-
-## ML lifecycle and evaluation
-
-Fashion Lens currently uses a frozen pretrained CLIP model. Catalog indexing uses the model as-is to generate embeddings.
-
-Catalog images are encoded offline. At search time, text or uploaded images are encoded into the same embedding space and compared against existing catalog vectors. Changing the embedding model requires regenerating compatible catalog embeddings.
-
-Future evaluation will compare baseline CLIP against Google SigLIP 2 and fashion-specialized models using held-out relevance judgments, ranking metrics, latency, memory consumption and indexing throughput.
 
 ## Roadmap
 
-- [x] Local dataset ingestion and SQLite catalog
-- [x] CPU-based pretrained CLIP integration
-- [x] Batch image embedding generation and persistence
-- [x] Keyword, fuzzy, semantic and visual search
-- [x] Hybrid and multimodal search
-- [x] Unified search engine
-- [x] Streamlit Discovery and Engineering Lab
-- [x] Use uv and a locked dependency environment
-- [x] Marketplace-inspired Discovery UI, category navigation, and catalog filters
-- [ ] Automated regression tests and CI quality gates
-- [ ] Docker packaging and public Cloud Run deployment
+- [x] Catalog ingestion, SQLite indexing and batch embeddings with pretrained CLIP on CPU
+- [x] Unified engine for keyword, fuzzy, semantic, visual, hybrid and multimodal search
+- [x] Streamlit Discovery with catalog filters and an Engineering Lab
+- [x] Locked dependencies with uv
+- [x] Docker packaging and public Cloud Run deployment
+- [ ] Visual search relevance evaluation using held-out queries and ranking metrics
+- [ ] Out-of-distribution image detection
+- [ ] Calibrated similarity thresholds
+- [ ] Improved no-results handling
+- [ ] Alternative ML model evaluation, including SigLIP 2 and fashion-specialized models
+- [ ] Automated regression testing and CI/CD
 - [ ] Compare exact retrieval with FAISS or another approximate vector index
-- [ ] Model benchmarking: CLIP, SigLIP 2 and fashion-specialized models
-- [ ] Formal relevance evaluation: Precision@K, Recall@K and NDCG@K
 - [ ] Model and dataset revision pinning, incremental indexing and rollback
 - [ ] Controlled fine-tuning experiment with held-out evaluation
-- [ ] Production readiness: observability, concurrency, security and cost controls
+- [ ] Production readiness improvements in observability, performance and security
 
 ## Scope and limitations
 
-Fashion Lens is a proof of concept for product discovery. The initial catalog lacks live pricing, inventory and transaction capabilities. Search relevance has not been formally validated, the lexical and vector indexes are initially snapshots, and the existing model is not fine-tuned on this catalog. Deployment cost, concurrent-user performance and image redistribution rights require validation before public release.
+Fashion Lens is a proof of concept for product discovery with a small catalog and low-resolution images. It uses pretrained CLIP without project-specific fine-tuning. Non-fashion images can return irrelevant fashion products, and search relevance still needs formal evaluation. Dataset and image redistribution rights remain unverified. The catalog has no live pricing, inventory or transaction capabilities.
 
 ## Acknowledgements
 
-- OpenAI CLIP
-- Hugging Face Datasets
-- PyTorch
-- Streamlit
-- SQLite FTS5
-- RapidFuzz
-- uv
-
-Fashion Lens is an independent engineering portfolio project with no affiliation with any website
+OpenAI CLIP, Hugging Face Datasets, PyTorch, Streamlit, SQLite FTS5, RapidFuzz and uv.

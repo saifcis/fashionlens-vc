@@ -8,3 +8,9 @@ indexes/
 __pycache__/
 *.log
 .venv-uv/
+/deployment/hf-cache/
+/reports/
+.env.*
+secrets.toml
+*.pem
+*.key
