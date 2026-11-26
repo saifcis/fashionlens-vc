@@ -1,7 +1,7 @@
 .venv/
 data/
 models/
-embeddings/
+/embeddings/
 indexes/
 .cache/
 .env
