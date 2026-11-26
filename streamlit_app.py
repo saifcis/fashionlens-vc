@@ -1,15 +1,13 @@
+from functools import partial
 
 import streamlit as st
 
 from app.search.engine import SearchEngine
 from ui import discovery, engineering_lab
+from ui.components import apply_styles
 
 
-st.set_page_config(
-    page_title="FashionLens",
-    page_icon="🔍",
-    layout="wide"
-)
+st.set_page_config(page_title="FashionLens", layout="wide")
 
 
 @st.cache_resource
@@ -17,41 +15,23 @@ def load_engine():
     return SearchEngine()
 
 
-st.sidebar.title("FashionLens")
+apply_styles()
 
-st.sidebar.caption(
-    "Intelligent Fashion Discovery"
-)
+with st.container(key="site_header"):
+    st.html('<div class="fl-wordmark">FASHION<span>LENS</span></div>')
 
-page = st.sidebar.radio(
-    "Navigation",
-    ["Discovery", "Engineering Lab"]
-)
-
-st.sidebar.divider()
-
-st.sidebar.caption(
-    "Independent ML engineering portfolio project."
-)
-
-
-with st.spinner("Initializing FashionLens..."):
-
+with st.spinner("Loading FashionLens…"):
     engine = load_engine()
 
-
-st.title("FashionLens")
-
-st.caption(
-    "Multimodal Fashion Search & Discovery Engine"
+page = st.navigation(
+    [
+        st.Page(partial(discovery.render, engine), title="FashionLens", default=True),
+        st.Page(
+            partial(engineering_lab.render, engine),
+            title="Engineering Lab",
+            url_path="engineering-lab",
+        ),
+    ],
+    position="hidden",
 )
-
-
-if page == "Discovery":
-
-    discovery.render(engine)
-
-else:
-
-    engineering_lab.render(engine)
-
+page.run()

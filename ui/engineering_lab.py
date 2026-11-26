@@ -1,6 +1,5 @@
 
 import time
-import sqlite3
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +17,7 @@ SEARCH_MODES = {
 
 def render(engine):
 
-    st.header("Engineering Lab")
+    st.html('<div class="fl-results-heading"><h1>Engineering Lab</h1></div>')
 
     st.caption(
         "Compare search mechanisms, performance "
@@ -34,21 +33,20 @@ def render(engine):
 
         with st.form("comparison_form"):
 
-            query = st.text_input(
-                "Comparison query",
-                value="black leather handbag",
-                max_chars=500
-            )
+            query_column, limit_column = st.columns([3, 1])
+            with query_column:
+                query = st.text_input(
+                    "Comparison query",
+                    value="black leather handbag",
+                    max_chars=500
+                )
+            with limit_column:
+                top_k = st.slider("Results per mechanism", 3, 10, 5)
 
             selected_modes = st.multiselect(
                 "Search mechanisms",
                 list(SEARCH_MODES.keys()),
                 default=list(SEARCH_MODES.keys())
-            )
-
-            top_k = st.slider(
-                "Results per mechanism",
-                3, 10, 5
             )
 
             compare = st.form_submit_button(
@@ -127,7 +125,8 @@ def render(engine):
             st.bar_chart(
                 df.set_index("Search mechanism")[
                     "Latency (ms)"
-                ]
+                ],
+                color="#111111",
             )
 
             st.caption(
@@ -139,7 +138,7 @@ def render(engine):
 
             results = comparison["results"]
 
-            columns = st.columns(len(results))
+            columns = st.columns(len(results), gap="medium")
 
             for column, (label, result) in zip(
                 columns, results.items()
@@ -151,27 +150,14 @@ def render(engine):
 
                     render_products(
                         result["products"],
-                        result["mode"],
-                        columns=1
+                        score_mode=result["mode"],
                     )
 
     with tab2:
 
         st.subheader("Catalog and model information")
 
-        with sqlite3.connect(
-            "data/catalog.db"
-        ) as connection:
-
-            product_count = connection.execute(
-                "SELECT COUNT(*) FROM products"
-            ).fetchone()[0]
-
-            category_count = connection.execute(
-                "SELECT COUNT(DISTINCT article_type) "
-                "FROM products"
-            ).fetchone()[0]
-
+        product_count, category_count = engine.catalog.statistics()
         embeddings = engine.vector.embeddings
 
         c1, c2, c3 = st.columns(3)

@@ -1,6 +1,9 @@
+from base64 import b64encode
+from html import escape
+from mimetypes import guess_type
+from pathlib import Path
 
 import streamlit as st
-from pathlib import Path
 
 
 SCORE_LABELS = {
@@ -9,46 +12,54 @@ SCORE_LABELS = {
     "semantic": "Cosine similarity",
     "visual": "Cosine similarity",
     "hybrid": "RRF score",
-    "multimodal": "Cosine similarity"
+    "multimodal": "Cosine similarity",
 }
 
 
-def render_products(products, mode, columns=4):
+def apply_styles():
+    st.html(Path(__file__).with_name("styles.css"))
 
+
+@st.cache_data(max_entries=1024, show_spinner=False)
+def image_source(path, modified_at):
+    media_type = guess_type(path.name)[0] or "image/jpeg"
+    content = b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{media_type};base64,{content}"
+
+
+def render_products(products, *, score_mode=None):
     if not products:
-        st.info("No matching products found.")
+        st.html('<p class="fl-empty">No matching products found.</p>')
         return
 
-    grid = st.columns(columns)
+    cards = []
+    for product in products:
+        name = escape(product["name"])
+        details = " · ".join(
+            escape(value)
+            for value in (product["article_type"], product["colour"])
+            if value
+        )
+        path = Path(product["image_path"])
+        if path.is_file():
+            source = image_source(path, path.stat().st_mtime_ns)
+            photo = f'<img src="{source}" alt="{name}" loading="lazy">'
+        else:
+            photo = "<span>Image unavailable</span>"
 
-    for index, product in enumerate(products):
+        score = ""
+        if score_mode:
+            label = SCORE_LABELS[score_mode]
+            score = f'<p class="fl-product-meta">{label} · {product["score"]:.4f}</p>'
 
-        with grid[index % columns]:
+        cards.append(f"""
+            <article class="fl-product">
+                <div class="fl-product-image">{photo}</div>
+                <h3>{name}</h3>
+                <p class="fl-product-meta">{details}</p>
+                {score}
+            </article>
+        """)
 
-            with st.container(border=True):
-
-                st.caption(f"Rank #{index + 1}")
-
-                image_path = Path(product["image_path"])
-
-                if image_path.is_file():
-                    st.image(
-                        str(image_path),
-                        width="stretch"
-                    )
-                else:
-                    st.caption("Image unavailable")
-
-                st.text(product["name"])
-
-                st.caption(
-                    f"{product['article_type']} | "
-                    f"{product['colour']}"
-                )
-
-                label = SCORE_LABELS.get(mode, "Score")
-
-                st.caption(
-                    f"{label}: {product['score']:.4f}"
-                )
-
+    layout = "fl-grid fl-grid-lab" if score_mode else "fl-grid"
+    st.html(f'<div class="{layout}">{"".join(cards)}</div>')
