@@ -130,7 +130,7 @@
     font-size: .875rem;
 }
 
-.fl-grid {
+.fl-grid, .st-key-product_grid {
     display: grid;
     grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 1.75rem 1rem;
@@ -141,7 +141,8 @@
 }
 
 .fl-product-image {
-    aspect-ratio: 4 / 5;
+    aspect-ratio: 1;
+    max-height: 180px;
     display: grid;
     place-items: center;
     background: var(--fl-surface);
@@ -150,13 +151,41 @@
 }
 
 .fl-product-image img {
-    height: auto;
-    width: auto;
-    max-width: min(120px, 85%);
-    max-height: min(160px, 90%);
-    min-width: min(100px, 65%);
+    width: min(110px, 85%);
+    height: min(147px, 88%);
     object-fit: contain;
     mix-blend-mode: multiply;
+}
+
+.st-key-product_grid [data-testid="stVerticalBlock"] {
+    gap: .45rem;
+}
+
+.st-key-product_grid button {
+    min-height: 0;
+    padding: .25rem .55rem;
+}
+
+.st-key-product_grid button p {
+    font-size: .78rem;
+}
+
+.st-key-search_area .st-key-query_image {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .65rem;
+}
+
+:is(.st-key-query_image, .st-key-results_header) [data-testid="stImage"] img {
+    height: 64px;
+    object-fit: contain;
+    background: var(--fl-surface);
+}
+
+.st-key-results_header .fl-results-heading {
+    display: grid;
+    gap: .15rem;
 }
 
 .fl-product h3 {
@@ -177,15 +206,15 @@
 }
 
 @media (max-width: 1180px) {
-    .fl-grid:not(.fl-grid-lab) { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    .st-key-product_grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
 
 @media (max-width: 960px) {
-    .fl-grid:not(.fl-grid-lab) { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .st-key-product_grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 @media (max-width: 720px) {
-    .fl-grid:not(.fl-grid-lab) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .st-key-product_grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .st-key-catalog_filters [data-testid="stHorizontalBlock"] {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -203,7 +232,7 @@
 }
 
 @media (max-width: 480px) {
-    .fl-grid:not(.fl-grid-lab) {
+    .st-key-product_grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 1.25rem .65rem;
     }

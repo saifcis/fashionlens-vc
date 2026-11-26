@@ -28,6 +28,7 @@ class SearchEngine:
         limit=10,
         collection="Discover",
         filters=None,
+        exclude_product_id=None,
     ):
 
         if limit < 1:
@@ -43,10 +44,15 @@ class SearchEngine:
             raise ValueError("Image required")
 
         eligible_ids = None
-        if collection != "Discover" or any(value is not None for value in (filters or {}).values()):
+        if (
+            collection != "Discover"
+            or any(value is not None for value in (filters or {}).values())
+            or exclude_product_id is not None
+        ):
             eligible_ids = {
                 product["id"]
                 for product in self.catalog.matching_products(collection, filters)
+                if product["id"] != exclude_product_id
             }
 
         if mode == "keyword":

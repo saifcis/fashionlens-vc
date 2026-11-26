@@ -46,6 +46,7 @@ def run_search(engine, request, collection, filters, limit):
             collection=collection,
             filters=filters,
             limit=limit,
+            exclude_product_id=request.get("product_id"),
         )
 
 
@@ -54,43 +55,118 @@ def open_visual_search():
 
 
 def reset_search():
-    for key in ("discovery_request", "discovery_result"):
+    for key in ("discovery_request", "discovery_result", "discovery_image", "discovery_image_error"):
         st.session_state.pop(key, None)
+    st.session_state.discovery_replacing = False
     st.session_state.discovery_form_version = st.session_state.get("discovery_form_version", 0) + 1
+
+
+def replace_image(mode):
+    st.session_state.discovery_mode = mode
+    st.session_state.discovery_replacing = True
+    st.session_state.discovery_upload_version = st.session_state.get("discovery_upload_version", 0) + 1
+
+
+def cancel_replacement():
+    st.session_state.discovery_replacing = False
+    st.session_state.pop("discovery_image_error", None)
+
+
+def accept_upload(key):
+    uploaded = st.session_state[key]
+    if uploaded is None:
+        return
+
+    try:
+        image = prepare_image(uploaded)
+    except ValueError as error:
+        st.session_state.discovery_image_error = str(error)
+        return
+
+    st.session_state.discovery_image = {"image": image}
+    st.session_state.pop("discovery_image_error", None)
+    st.session_state.discovery_replacing = False
+
+
+def find_similar(product):
+    try:
+        image = Path(product["image_path"]).read_bytes()
+    except OSError:
+        st.session_state.discovery_image_error = "This product image is unavailable."
+        return
+
+    reset_search()
+    open_visual_search()
+    query_image = {
+        "image": image,
+        "product_id": product["id"],
+    }
+    st.session_state.discovery_image = query_image
+    st.session_state.discovery_request = {
+        **query_image, "mode": "Visual", "text": "", "weight": 0.5,
+    }
+
+
+def render_image_controls(mode, form_version):
+    image = st.session_state.get("discovery_image")
+    if image:
+        with st.container(horizontal=True, vertical_alignment="center", key="query_image"):
+            st.image(image["image"], width=64)
+            st.markdown("**Query image**", width="content")
+            if st.session_state.get("discovery_replacing"):
+                st.button("Cancel", on_click=cancel_replacement)
+            else:
+                st.button("Replace", on_click=replace_image, args=(mode,))
+
+    if not image or st.session_state.get("discovery_replacing"):
+        upload_version = st.session_state.get("discovery_upload_version", 0)
+        key = f"discovery_upload_{form_version}_{upload_version}"
+        st.file_uploader(
+            "Product image", type=["jpg", "jpeg", "png"], key=key,
+            on_change=accept_upload, args=(key,),
+        )
 
 
 def render(engine):
     current_request = st.session_state.get("discovery_request", {})
     form_version = st.session_state.get("discovery_form_version", 0)
+    if "discovery_mode" not in st.session_state:
+        st.session_state.discovery_mode = current_request.get("mode", "Hybrid")
+    mode = st.session_state.discovery_mode
+    image = st.session_state.get("discovery_image") if mode in IMAGE_MODES else None
+    needs_image = mode in IMAGE_MODES and (
+        not image or st.session_state.get("discovery_replacing", False)
+    )
+
     with st.container(key="search_area"):
+        if mode in IMAGE_MODES:
+            render_image_controls(mode, form_version)
+
+        if error := st.session_state.get("discovery_image_error"):
+            st.warning(error)
+
         search, visual = st.columns(2, vertical_alignment="top")
         with visual:
-            st.button(
-                "Search by image", on_click=open_visual_search,
-                icon=":material/photo_camera:", width="stretch",
-            )
+            if mode != "Visual":
+                st.button(
+                    "Search by image", on_click=open_visual_search,
+                    icon=":material/photo_camera:", width="stretch",
+                )
 
-        with search:
-            if "discovery_mode" not in st.session_state:
-                st.session_state.discovery_mode = current_request.get("mode", "Hybrid")
-            mode = st.session_state.discovery_mode
-            with st.form("discovery_search", border=False):
+        with search, st.form("discovery_search", border=False):
+            text = ""
+            if mode == "Visual":
+                submitted = st.form_submit_button("Search", type="primary", disabled=needs_image)
+            else:
                 field, action = st.columns(2, vertical_alignment="top")
                 with field:
-                    text = ""
-                    uploaded = None
-                    if mode != "Visual":
-                        text = st.text_input(
-                            "Search products", value=current_request.get("text", ""),
-                            placeholder="Search the catalog, e.g. black leather handbag",
-                            label_visibility="collapsed", max_chars=500, key=f"discovery_query_{form_version}",
-                        )
-                    if mode in IMAGE_MODES:
-                        uploaded = st.file_uploader(
-                            "Product image", type=["jpg", "jpeg", "png"], key=f"discovery_upload_{form_version}",
-                        )
+                    text = st.text_input(
+                        "Search products", value=current_request.get("text", ""),
+                        placeholder="Search the catalog, e.g. black leather handbag",
+                        label_visibility="collapsed", max_chars=500, key=f"discovery_query_{form_version}",
+                    )
                 with action:
-                    submitted = st.form_submit_button("Search", type="primary")
+                    submitted = st.form_submit_button("Search", type="primary", disabled=needs_image)
 
     with st.container(key="collection_nav"):
         collection = st.segmented_control(
@@ -124,21 +200,18 @@ def render(engine):
                     st.caption(f"Text weight · {1 - weight:.0%}")
 
     if submitted:
-        try:
-            if mode != "Visual" and not text.strip():
-                raise ValueError("Enter a search query.")
-            if mode in IMAGE_MODES and uploaded is None:
-                raise ValueError("Choose a product image.")
+        if mode != "Visual" and not text.strip():
+            st.warning("Enter a search query.")
+        elif needs_image:
+            st.warning("Choose a product image.")
+        else:
             st.session_state.discovery_request = {
+                **(image or {"image": None}),
                 "mode": mode,
                 "text": text.strip(),
-                "image": prepare_image(uploaded) if uploaded is not None else None,
-                "filename": uploaded.name if uploaded is not None else "",
                 "weight": weight,
             }
             st.session_state.pop("discovery_result", None)
-        except ValueError as error:
-            st.warning(str(error))
 
     request = st.session_state.get("discovery_request")
     if request:
@@ -159,23 +232,41 @@ def render(engine):
         else:
             products = result[1]
 
-        query = request["text"]
-        filename = request["filename"]
-        title = f'Results for “{query}”' if query else f"Results for {filename}"
-        if query and filename:
-            title += f" + {filename}"
     else:
         products = engine.catalog.matching_products(collection, filters, limit)
+
+    render_results_header(request, collection, len(products))
+    render_products(products, on_find_similar=find_similar)
+
+
+def render_results_header(request, collection, count):
+    image_search = request and request["image"] is not None
+    mode = request["mode"] if request else None
+    if mode == "Visual":
+        title = "Visually similar products"
+    elif request:
+        title = f'Results for “{request["text"]}”'
+    else:
         title = "Explore the catalog" if collection == "Discover" else collection
 
-    count = f'{len(products)} {"result" if len(products) == 1 else "results"} shown'
+    noun = "product" if count == 1 else "products"
+    summary = f"{count} matching {noun}" if image_search else (
+        f'{count} {"result" if count == 1 else "results"} shown'
+    )
+
     with st.container(key="results_header", horizontal=True,
                       horizontal_alignment="distribute", vertical_alignment="center"):
-        st.html(
-            f'<div class="fl-results-heading"><h1>{escape(title)}</h1>'
-            f'<span>{count}</span></div>'
-        )
+        with st.container(horizontal=True, vertical_alignment="center", width="content"):
+            if image_search:
+                st.image(request["image"], width=64)
+            mode_label = f'<span>Search mode: {mode} · CLIP</span>' if image_search else ""
+            st.html(
+                f'<div class="fl-results-heading"><h1>{escape(title)}</h1>'
+                f'<span>{summary}</span>{mode_label}</div>',
+                width="content",
+            )
         if request:
-            st.button("Clear search", on_click=reset_search)
-
-    render_products(products)
+            with st.container(horizontal=True, vertical_alignment="center", width="content"):
+                if image_search:
+                    st.button("Change image", on_click=replace_image, args=(mode,))
+                st.button("Clear" if image_search else "Clear search", on_click=reset_search)

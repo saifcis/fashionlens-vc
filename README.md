@@ -4,7 +4,7 @@
 
 Fashion Lens is an independent engineering portfolio project exploring modern fashion discovery through keyword search, visual similarity, semantic retrieval and multimodal machine learning.
 
-Inspired by fashion resale marketplaces such as Vestiaire Collective, the project demonstrates how traditional search techniques and pretrained ML models can work together to create an intelligent product discovery experience.
+Inspired by fashion resale marketplaces, the project demonstrates how traditional search techniques and pretrained ML models can work together to create an intelligent product discovery experience.
 
 ## Overview
 
@@ -35,18 +35,6 @@ Weighted embedding fusion is experimental. A request such as “the same bag but
 - Filters apply before the result limit across all search modes.
 - Responsive grid with product photographs, names, article types, and colours.
 - Marketplace-inspired presentation, with Fashion Lens branding.
-
-## Engineering Lab
-
-Open `/engineering-lab` directly. Discovery lives at `/`.
-
-- Side-by-side comparison of keyword, fuzzy, semantic and hybrid retrieval.
-- Actual single-run search latency measurements.
-- Retrieved product comparison and algorithm-specific scores.
-- Catalog size, article types, embedding dimensions and vector memory statistics.
-- Model and search architecture overview.
-
-BM25, fuzzy, cosine similarity, and RRF use different scales. Use each score to interpret its own result list. The lab reports exploratory single-run timings.
 
 ## Architecture
 
@@ -281,4 +269,4 @@ Fashion Lens is a proof of concept for product discovery. The initial catalog la
 - RapidFuzz
 - uv
 
-Fashion Lens is an independent engineering portfolio project with no affiliation with Vestiaire Collective.
+Fashion Lens is an independent engineering portfolio project with no affiliation with any website
