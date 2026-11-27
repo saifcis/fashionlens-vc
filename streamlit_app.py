@@ -3,9 +3,12 @@ from functools import partial
 import streamlit as st
 
 from app.search.engine import SearchEngine
+from app.search.relevance import configure_relevance_logging
 from ui import discovery, engineering_lab
 from ui.components import apply_styles
 
+
+configure_relevance_logging()
 
 st.set_page_config(page_title="Fashion Lens", layout="wide")
 

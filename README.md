@@ -19,6 +19,13 @@ Fashion Lens is an independent engineering portfolio project inspired by fashion
 
 Weighted embedding fusion is experimental. A request such as “the same bag but in red” may return similar bags in other colours.
 
+Visual and multimodal search use CLIP zero-shot fashion relevance detection. Set
+`FASHION_LENS_RELEVANCE_MODE` to `OFF`, `SHADOW`, `SOFT` (default), or `ENFORCE`.
+SOFT lets users continue after a warning. ENFORCE blocks non-fashion images in
+visual and multimodal search. Multimodal users can search with text alone.
+If classification fails technically, search continues in every mode.
+See [Fashion relevance observability](docs/fashion-relevance-observability.md) for the event schema and Logs Explorer filters.
+
 ## Discovery
 
 - Six selectable search modes, with Hybrid selected by default.
@@ -127,6 +134,17 @@ docker run --rm -p 127.0.0.1:8080:8080 fashionlens:local
 ```
 
 Open [Fashion Lens locally](http://localhost:8080/).
+
+### Cloud Run deployment script
+
+From a clean checkout, prepare the catalog, images, embeddings and Hugging Face cache as shown above. Sign in with `gcloud` and configure Docker authentication for the Artifact Registry host. You need access to pull and push images, update the existing Cloud Run service, read its logs and push Git release tags.
+
+```bash
+./deploy-fashion-gcp --dry-run
+./deploy-fashion-gcp
+```
+
+The script deploys the latest committed `origin/main`. Use `--force` to redeploy an already-serving commit with its existing release image and version, or `--help` for configuration overrides. Run deployments from one checkout/operator at a time. Local logs and release history are stored under `deployment/`.
 
 ## Command-line search examples
 

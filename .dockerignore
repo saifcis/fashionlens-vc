@@ -22,10 +22,12 @@ __pycache__/
 **/.env
 **/.env.*
 **/secrets.toml
+**/credentials.json
+**/.netrc
 
 *.log
-*.pem
-*.key
+**/*.pem
+**/*.key
 
 README.md
 
@@ -33,3 +35,10 @@ README.md
 data/evaluation/
 reports/
 scripts/evaluate_visual_search.py
+
+/deployment/logs/
+/deployment/history.tsv
+
+# Offline CLIP domain evaluation
+experiments/
+scripts/evaluate_clip_domain.py

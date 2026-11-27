@@ -94,6 +94,11 @@ class VectorSearch:
             image_path
         )
 
+        return self.search_multimodal_vector(
+            text, image_embedding, image_weight, limit, eligible_ids=eligible_ids
+        )
+
+    def search_multimodal_vector(self, text, image_embedding, image_weight, limit, *, eligible_ids=None):
         text_embedding = self.provider.encode_text(text)
 
         combined = (

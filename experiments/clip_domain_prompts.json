@@ -1,0 +1,25 @@
+{
+  "model": "openai/clip-vit-base-patch32",
+  "rules": {"retrieval_threshold": 0.653781, "zero_shot_margin": 0.0, "rescue_margin": -0.02},
+  "prompts": {
+    "fashion": {
+      "clothing": ["a photograph of a fashion garment such as a shirt, jacket, dress or trousers", "a photo of clothing or apparel for sale, including a garment worn by a person"],
+      "footwear": ["a photograph of shoes, boots, sandals or sneakers", "a picture of footwear worn on feet or displayed as a fashion product"],
+      "handbags": ["a photograph of a fashion handbag, purse, clutch or shoulder bag", "a picture of a person carrying a handbag, or a purse displayed for sale"],
+      "accessories": ["a photograph of a wearable fashion accessory such as jewelry, sunglasses, a wristwatch or a hat", "a product photo of a necklace, earrings, a scarf, a belt or a fashion accessory"],
+      "personal-care": ["a photograph of a perfume bottle, cosmetics, makeup or a personal care product", "a beauty product for personal use such as fragrance, lipstick or skincare"],
+      "fashion-in-context": ["a real-world photograph featuring an outfit or fashion item in a busy street scene", "a photo showing clothing or fashion products partially obscured in a shop window, crowded market or dimly lit room"]
+    },
+    "non-fashion": {
+      "logos": ["an isolated corporate logo or wordmark on a plain background", "a flat graphic showing a company logo, brand symbol or lettering with no physical product"],
+      "documents": ["a scan of a document, printed page, handwritten letter or form", "a flat image of a map, chart, poster or non-fashion graphic illustration"],
+      "technical-diagrams": ["a technical schematic with lines, symbols or engineering annotations", "a standalone electrical symbol, circuit diagram or technical drawing"],
+      "electronics": ["a photograph of an electronic device such as a computer, circuit board or telephone", "a product photo of a gadget, electronic component, connector or appliance"],
+      "household": ["a photograph of a household object such as furniture, a lamp, a mug or a cushion", "a photograph of a domestic item such as kitchenware, a storage basket or home decor"],
+      "vehicles": ["a photograph of a vehicle such as a car, truck, train or boat", "a real-world photo of a transport vehicle in traffic, a garage or an exhibition"],
+      "buildings": ["a photograph of a building, architecture or an architectural landmark", "a photo of a building exterior, a room interior or an urban streetscape"],
+      "food": ["a photograph of a meal, fruit, vegetables, dessert or other food", "a photo of edible ingredients, a plated dish or a drink"],
+      "landscapes": ["a photograph of a natural landscape such as mountains, a forest or a waterfall", "a nature photo showing scenery, rocks, plants or water"]
+      }
+  }
+}

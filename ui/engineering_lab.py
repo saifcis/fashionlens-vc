@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from ui.components import render_products
+from ui.query_image import prepare_image, prepare_query
 
 
 SEARCH_MODES = {
@@ -24,9 +25,10 @@ def render(engine):
         "and retrieved products."
     )
 
-    tab1, tab2 = st.tabs([
+    tab1, tab2, relevance_tab = st.tabs([
         "Search Comparison",
-        "System Overview"
+        "System Overview",
+        "Fashion Relevance"
     ])
 
     with tab1:
@@ -221,3 +223,48 @@ def render(engine):
             "Product Results",
             language="text"
         )
+
+
+    with relevance_tab:
+        render_relevance(engine)
+
+
+def render_relevance(engine):
+    st.subheader("Fashion Relevance")
+    st.caption(f"Configured relevance mode · {engine.relevance.mode.value}")
+    st.caption(
+        "On 94 clear independent images, retrieval at 0.653781 reached 69.1% accuracy "
+        "and 52.2% fashion recall. Zero-shot reached 98.9% accuracy and 97.8% recall. "
+        "This measures query domain. Product recommendation relevance requires separate judgments."
+    )
+
+    upload = st.file_uploader("Image to assess", type=["jpg", "jpeg", "png"], key="lab_relevance_image",
+                              on_change=clear_relevance_assessment)
+    if st.button("Assess image", disabled=upload is None):
+        try:
+            query = prepare_query(
+                engine, prepare_image(upload), st.session_state, "lab_image_embedding",
+            )
+        except (ValueError, OSError):
+            st.error("The image could not be prepared.")
+            return
+        st.session_state.lab_relevance_assessment = (
+            query.relevance, engine.relevance.decision(query, "visual"),
+            engine.relevance.decision(query, "multimodal"),
+        )
+
+    if assessment := st.session_state.get("lab_relevance_assessment"):
+        diagnostic, visual, multimodal = assessment
+        st.write(f"Predicted domain · {diagnostic.domain or 'Unavailable'}")
+        st.write(f"Decision · Visual: {visual} · Multimodal: {multimodal}")
+        if diagnostic.error:
+            st.warning(f"Classification error · {diagnostic.error}")
+        if scores := diagnostic.scores:
+            st.write(f"Fashion · {scores['fashion_category']} ({scores['fashion_cosine']:.4f})")
+            st.write(f"Non-fashion · {scores['non_fashion_category']} ({scores['non_fashion_cosine']:.4f})")
+            st.caption(f"Additional classification scoring · {diagnostic.latency_ms:.3f} ms · Raw cosine scores")
+
+
+def clear_relevance_assessment():
+    st.session_state.pop("lab_relevance_assessment", None)
+    st.session_state.pop("lab_image_embedding", None)

@@ -1,53 +1,89 @@
 import logging
 from html import escape
-from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from time import perf_counter
 
 import streamlit as st
-from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.search.catalog import FILTER_FIELDS, NAVIGATION
+from app.search.relevance import RelevanceBlocked
 from ui.components import render_products
+from ui.query_image import prepare_image, prepare_query
 
 
 MODES = ["Keyword", "Fuzzy", "Semantic", "Visual", "Hybrid", "Multimodal"]
 IMAGE_MODES = {"Visual", "Multimodal"}
 
 
-def prepare_image(upload):
-    if upload.size > 5 * 1024 * 1024:
-        raise ValueError("Maximum image size is 5 MB.")
-
-    try:
-        with Image.open(BytesIO(upload.getvalue())) as source:
-            if source.width * source.height > 20_000_000:
-                raise ValueError("Image resolution is too large.")
-            image = ImageOps.exif_transpose(source).convert("RGB")
-            image.thumbnail((1024, 1024))
-            buffer = BytesIO()
-            image.save(buffer, format="JPEG")
-            return buffer.getvalue()
-    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as error:
-        raise ValueError("Choose a valid JPG or PNG image.") from error
-
-
 def run_search(engine, request, collection, filters, limit):
-    with TemporaryDirectory() as directory:
-        image_path = None
-        if request["image"] is not None:
-            image_path = Path(directory) / "query.jpg"
-            image_path.write_bytes(request["image"])
-        return engine.search(
+    relevance = engine.relevance
+    previous_configuration = request.get("image_query_configuration")
+    if request["image"] is not None and previous_configuration != relevance.configuration:
+        if previous_configuration is not None:
+            request.pop("override_relevance", None)
+        request["image_query"] = prepare_query(
+            engine, request["image"], st.session_state, "discovery_image_embedding",
+        )
+        request["image_query_configuration"] = relevance.configuration
+
+    fallback_id = request.pop("image_fallback_query_id", None)
+    start = perf_counter() if fallback_id else None
+    products = None
+    try:
+        products = engine.search(
             mode=request["mode"].lower(),
             text=request["text"],
-            image_path=image_path,
+            image_query=request.get("image_query"),
+            override_relevance=request.get("override_relevance", False),
             image_weight=request["weight"],
             collection=collection,
             filters=filters,
             limit=limit,
             exclude_product_id=request.get("product_id"),
         )
+        return products
+    finally:
+        if fallback_id:
+            relevance.record_action(
+                fallback_id, "multimodal", "remove_image", "text_only_fallback",
+                search_status="failed" if products is None else "completed",
+                search_latency_ms=(perf_counter() - start) * 1000,
+                result_count=None if products is None else len(products),
+            )
+
+
+def continue_without_image():
+    request = st.session_state.discovery_request
+    request.update(mode="Semantic", image=None)
+    request["image_fallback_query_id"] = request.pop("image_query").query_id
+    request.pop("override_relevance", None)
+    request.pop("image_query_configuration", None)
+    request.pop("product_id", None)
+    request.pop("relevance_decision", None)
+    st.session_state.discovery_mode = "Semantic"
+    st.session_state.pop("discovery_image", None)
+    st.session_state.pop("discovery_image_embedding", None)
+    st.session_state.pop("discovery_image_error", None)
+    st.session_state.pop("discovery_result", None)
+    st.session_state.discovery_replacing = False
+    st.session_state.discovery_upload_version = st.session_state.get("discovery_upload_version", 0) + 1
+
+
+def confirm_image():
+    st.session_state.discovery_request["override_relevance"] = True
+    st.session_state.pop("discovery_result", None)
+
+
+def render_relevance_warning(request, decision):
+    st.warning("This may not be a fashion item.")
+    st.caption("For better results, upload a photograph of clothing, shoes, bags or fashion accessories.")
+
+    with st.container(horizontal=True):
+        st.button("Upload another image", on_click=replace_image, args=(request["mode"],))
+        if decision == "confirm" and not st.session_state.get("discovery_replacing"):
+            st.button("Search anyway", type="primary", on_click=confirm_image)
+        if request["mode"] == "Multimodal":
+            st.button("Remove image and search", on_click=continue_without_image)
 
 
 def open_visual_search():
@@ -55,7 +91,8 @@ def open_visual_search():
 
 
 def reset_search():
-    for key in ("discovery_request", "discovery_result", "discovery_image", "discovery_image_error"):
+    for key in ("discovery_request", "discovery_result", "discovery_image",
+                "discovery_image_embedding", "discovery_image_error"):
         st.session_state.pop(key, None)
     st.session_state.discovery_replacing = False
     st.session_state.discovery_form_version = st.session_state.get("discovery_form_version", 0) + 1
@@ -84,6 +121,11 @@ def accept_upload(key):
         return
 
     st.session_state.discovery_image = {"image": image}
+    request = st.session_state.get("discovery_request")
+    st.session_state.pop("discovery_image_embedding", None)
+    if request and request["image"] is not None:
+        st.session_state.pop("discovery_request", None)
+        st.session_state.pop("discovery_result", None)
     st.session_state.pop("discovery_image_error", None)
     st.session_state.discovery_replacing = False
 
@@ -215,25 +257,34 @@ def render(engine):
 
     request = st.session_state.get("discovery_request")
     if request:
-        signature = (collection, tuple(filters.items()), limit)
+        signature = (collection, tuple(filters.items()), limit, engine.relevance.configuration)
         result = st.session_state.get("discovery_result")
         if result is None or result[0] != signature:
             try:
                 with st.spinner("Searching the catalog…"):
                     products = run_search(engine, request, collection, filters, limit)
+                request.pop("relevance_decision", None)
                 st.session_state.discovery_result = (signature, products)
+            except RelevanceBlocked as error:
+                request["relevance_decision"] = error.decision
+                st.session_state.discovery_result = (signature, None)
+                products = None
             except ValueError as error:
                 st.warning(str(error))
                 return
             except Exception:
                 st.error("The search could not be completed. Try again.")
-                logging.exception("Discovery search failed")
+                logging.error("Discovery search failed")
                 return
         else:
             products = result[1]
 
     else:
         products = engine.catalog.matching_products(collection, filters, limit)
+
+    if products is None:
+        render_relevance_warning(request, request["relevance_decision"])
+        return
 
     render_results_header(request, collection, len(products))
     render_products(products, on_find_similar=find_similar)
