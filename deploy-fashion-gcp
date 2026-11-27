@@ -417,6 +417,27 @@ registry_tags() {
 registry_digest() {
     awk -F '\t' -v tag="$1" '$1 == tag { print $2 }' "$tmp/registry.tsv"
 }
+# Older releases may use an OCI index tag while Cloud Run reports its platform manifest.
+matches_serving_digest() {
+    local tagged_digest=$1 serving_digest=$2
+    [[ $tagged_digest == "$serving_digest" ]] && return 0
+    [[ $tagged_digest =~ $digest_pattern ]] || return 1
+    capture "$tmp/serving-index.json" timeout 60 docker buildx imagetools inspect --raw "$IMAGE@$tagged_digest" ||
+        return 1
+    python3 - "$tmp/serving-index.json" "$serving_digest" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    index = json.load(stream)
+platform_manifests = [
+    manifest.get("digest") for manifest in index.get("manifests", [])
+    if manifest.get("platform", {}).get("os") == "linux"
+    and manifest.get("platform", {}).get("architecture") == "amd64"
+]
+sys.exit(platform_manifests != [sys.argv[2]])
+PYTHON
+}
 create_registry_tag() {
     local alias=$1
     last_command="Artifact Registry create-only tag $IMAGE:$alias at $digest"
@@ -610,16 +631,17 @@ load_image "$old_digest"
 previous_version=$(image_label "$IMAGE@$old_digest" version)
 previous_sha=$(image_label "$IMAGE@$old_digest" revision)
 if [[ -z $previous_version ]]; then
-    version_file="$tmp/baselines"
-    awk -F '\t' -v digest="$old_digest" '$2 == digest {print $1}' "$tmp/registry.tsv" > "$version_file"
     baselines=()
-    while IFS= read -r value; do
-        if [[ $value =~ $semver ]]; then baselines+=("$value"); fi
-    done < "$version_file"
-    (( ${#baselines[@]} == 1 )) || fail 'The deployed digest must have exactly one numeric registry tag when it has no OCI version.'
+    while IFS=$'\t' read -r value tagged_digest; do
+        if [[ $value =~ $semver ]] && matches_serving_digest "$tagged_digest" "$old_digest"; then
+            baselines+=("$value")
+        fi
+    done < "$tmp/registry.tsv"
+    (( ${#baselines[@]} == 1 )) || fail 'The deployed digest must match exactly one numeric registry tag when it has no OCI version.'
     previous_version=${baselines[0]}
 fi
-[[ $previous_version =~ $semver && $(registry_digest "$previous_version") == "$old_digest" ]] ||
+[[ $previous_version =~ $semver ]] &&
+    matches_serving_digest "$(registry_digest "$previous_version")" "$old_digest" ||
     fail 'The deployed image version and registry version tag disagree.'
 [[ -z $previous_sha || $previous_sha =~ ^[0-9a-f]{40}$ ]] ||
     fail 'The deployed image has an invalid OCI revision.'
